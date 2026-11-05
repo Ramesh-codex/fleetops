@@ -154,6 +154,66 @@ def test_moving_mode_beats_naive_on_eta_error():
     assert errs["moving"] < errs["naive"] / 2
 
 
+def test_gps_gap_detected_even_if_check_stale_never_runs():
+    # A consumer chewing through a backlog in big batches may never call
+    # check_stale() while a bus is silent. The gap must still be recorded.
+    r = simulate(SimConfig(seed=25, n_buses=4, dropout_prob=1.0))
+    t = Tracker(r.routes, r.frame, r.bus_route)
+    for p in r.pings:
+        t.ingest(p)                       # no check_stale at all
+    assert {i.bus_id for i in t.incidents.values()} == set(r.dropouts)
+    assert all(i.closed_ts is not None for i in t.incidents.values())
+
+
+def test_gap_and_periodic_check_give_same_incident_ids():
+    r = simulate(SimConfig(seed=26, n_buses=4, dropout_prob=1.0))
+    a = Tracker(r.routes, r.frame, r.bus_route)
+    b = Tracker(r.routes, r.frame, r.bus_route)
+    for p in r.pings:
+        a.ingest(p)
+        a.check_stale(p.ts)
+        b.ingest(p)
+    assert set(a.incidents) == set(b.incidents)
+
+
+def test_new_trip_resets_seq_and_speed():
+    r = simulate(SimConfig(seed=27, n_buses=1))
+    t = Tracker(r.routes, r.frame, r.bus_route)
+    for p in r.pings:
+        t.ingest(p)
+    span = r.end_ts - r.pings[0].ts + 600
+    day2 = [p.model_copy(update={"trip_id": "T2", "event_id": "d2-" + p.event_id, "ts": p.ts + span})
+            for p in r.pings]
+    assert t.ingest(day2[0]) == "accepted"            # seq restarted but new trip -> accepted
+    assert t.buses[day2[0].bus_id].speed_est is None  # no speed carried over a 10-min gap
+    for p in day2[1:]:
+        t.ingest(p)
+    assert t.buses[day2[0].bus_id].finished
+    assert not t.incidents                             # gap between trips is not GPS loss
+
+
+def test_straggler_from_previous_trip_is_dropped():
+    r = simulate(SimConfig(seed=28, n_buses=1))
+    t = Tracker(r.routes, r.frame, r.bus_route)
+    p0, p1 = r.pings[0], r.pings[1]
+    t.ingest(p1.model_copy(update={"trip_id": "T2", "event_id": "n1", "ts": p1.ts + 5000}))
+    assert t.ingest(p0) == "out_of_order"
+
+
+def test_export_restore_roundtrip():
+    r = simulate(SimConfig(seed=29, n_buses=3))
+    a = Tracker(r.routes, r.frame, r.bus_route)
+    half = len(r.pings) // 2
+    for p in r.pings[:half]:
+        a.ingest(p)
+    b = Tracker(r.routes, r.frame, r.bus_route)
+    b.restore([a.export_bus(x) for x in a.buses], [])
+    for p in r.pings[half:]:
+        a.ingest(p)
+        b.ingest(p)
+    assert a.snapshot() == b.snapshot()
+
+
 def test_validation_rejects_bad_coordinates():
     with pytest.raises(Exception):
         GpsPing(event_id="e", bus_id="b", trip_id="t", seq=0, ts=0, lat=95, lon=0, speed_mps=0, heading=0)

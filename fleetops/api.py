@@ -1,24 +1,30 @@
-"""HTTP service: replays the simulator through the tracker in (accelerated)
-real time and serves state, alerts, incidents, metrics, and a live map.
+"""HTTP service: bus state, alerts, incidents, metrics and a live map.
+
+Two modes (FLEETOPS_MODE):
+  demo (default) - replays the simulator through an in-process tracker.
+                   No Kafka or database needed.
+  db             - read-only view of what the Kafka consumer wrote to Postgres.
 
 Run:  uvicorn fleetops.api:app --port 8000
-Env:  FLEETOPS_SEED (42), FLEETOPS_BUSES (12), FLEETOPS_SPEEDUP (10),
-      FLEETOPS_FAULTS (1 = inject duplicates/reorders/dropouts/breakdowns)
+Env:  FLEETOPS_MODE, FLEETOPS_DB, FLEETOPS_SEED (42), FLEETOPS_BUSES (12),
+      FLEETOPS_SPEEDUP (10), FLEETOPS_FAULTS (1)
 """
 
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 
+from .geo import LocalFrame
 from .models import GpsPing
 from .simulator import SimConfig, simulate
 from .tracker import Tracker
@@ -87,7 +93,9 @@ class Runtime:
             self.new_run()
 
 
+MODE = os.getenv("FLEETOPS_MODE", "demo")
 rt: Runtime | None = None
+pg = None          # psycopg connection in db mode
 
 
 async def _replay_loop() -> None:
@@ -98,34 +106,63 @@ async def _replay_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global rt
-    rt = Runtime()
-    task = asyncio.create_task(_replay_loop())
+    global rt, pg
+    task = None
+    if MODE == "db":
+        from . import db
+        from .consumer import ensure_seeded, wait_for
+        pg = wait_for(lambda: db.connect(), "postgres")
+        ensure_seeded(pg)
+    else:
+        rt = Runtime()
+        task = asyncio.create_task(_replay_loop())
     yield
-    task.cancel()
+    if task:
+        task.cancel()
+    if pg:
+        pg.close()
 
 
-app = FastAPI(title="FleetOps tracking", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="FleetOps tracking", version="0.2.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
+
+
+def _db():
+    from . import db
+    return db
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "run": rt.run_no, "sim_now": rt.sim_now}
+    if MODE == "db":
+        row = pg.execute("SELECT max(last_ts) AS t FROM bus_state").fetchone()
+        return {"status": "ok", "mode": MODE, "run": 1, "sim_now": row["t"]}
+    return {"status": "ok", "mode": MODE, "run": rt.run_no, "sim_now": rt.sim_now}
 
 
 @app.get("/routes")
 def routes():
+    if MODE == "db":
+        return [r.model_dump() for r in _db().load_routes(pg)[0].values()]
     return [r.model_dump() for r in rt.sim.routes.values()]
 
 
 @app.get("/buses")
 def buses():
+    if MODE == "db":
+        rows = _db().q_buses(pg)
+        now = max((r["last_ts"] or 0 for r in rows), default=None)
+        return {"sim_now": now, "buses": rows}
     return {"sim_now": rt.sim_now, "buses": rt.tracker.snapshot()}
 
 
 @app.get("/buses/{bus_id}")
 def bus(bus_id: str):
+    if MODE == "db":
+        row = next((b for b in _db().q_buses(pg) if b["bus_id"] == bus_id), None)
+        if row is None:
+            raise HTTPException(404, "unknown bus")
+        return row
     if bus_id not in rt.tracker.buses:
         raise HTTPException(404, "unknown bus")
     snap = next(b for b in rt.tracker.snapshot() if b["bus_id"] == bus_id)
@@ -133,24 +170,50 @@ def bus(bus_id: str):
 
 
 @app.get("/notifications")
-def notifications(limit: int = 50):
+def notifications(limit: int = Query(50, ge=1, le=1000)):
+    if MODE == "db":
+        return _db().q_notifications(pg, limit)
     return [n.model_dump() for n in rt.tracker.notifications[-limit:][::-1]]
 
 
 @app.get("/incidents")
 def incidents():
+    if MODE == "db":
+        return _db().q_incidents(pg)
     return [i.model_dump() for i in sorted(rt.tracker.incidents.values(), key=lambda i: -i.opened_ts)]
+
+
+@app.get("/stops/near")
+def stops_near(lat: float = Query(ge=-90, le=90), lon: float = Query(ge=-180, le=180),
+               radius_m: float = Query(500, gt=0, le=20000)):
+    """Stops within radius_m of a point, nearest first (PostGIS in db mode)."""
+    if MODE == "db":
+        return _db().q_stops_near(pg, lat, lon, radius_m)
+    frame = LocalFrame(lat, lon)
+    out = []
+    for r in rt.sim.routes.values():
+        for st in r.stops:
+            x, y = frame.to_xy(st.lat, st.lon)
+            dist = math.hypot(x, y)
+            if dist <= radius_m:
+                out.append({"stop_id": st.stop_id, "route_id": r.route_id, "name": st.name,
+                            "lat": st.lat, "lon": st.lon, "distance_m": dist})
+    return sorted(out, key=lambda s: s["distance_m"])[:50]
 
 
 @app.get("/stats")
 def stats():
+    if MODE == "db":
+        return {"run": 1, "counters": _db().q_counts(pg)}
     return {"run": rt.run_no, "counters": rt.tracker.counters,
             "pings_replayed": rt.cursor, "pings_total": len(rt.sim.pings)}
 
 
 @app.post("/pings")
 def post_ping(p: GpsPing):
-    """External ingestion entry point (a Kafka consumer will call the same code path)."""
+    """Demo-mode ingestion entry point. In db mode pings arrive through Kafka."""
+    if MODE == "db":
+        raise HTTPException(405, "db mode: publish pings to Kafka instead")
     return {"outcome": rt.ingest(p)}
 
 

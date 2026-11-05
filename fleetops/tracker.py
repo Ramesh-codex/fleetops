@@ -12,8 +12,8 @@ Design rules (each one is covered by a test):
 
 from __future__ import annotations
 
-import itertools
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from .geo import LocalFrame, Polyline
@@ -89,7 +89,10 @@ class Tracker:
         self.notifications: list[Notification] = []
         self.incidents: dict[str, Incident] = {}
         self._open_incident: dict[str, str] = {}      # bus_id -> incident_id
-        self._incident_ids = itertools.count(1)
+        # Change tracking, so a persistence layer can save exactly what changed.
+        self._dirty: set[str] = set()
+        self._new_notifications: list[Notification] = []
+        self._dirty_incidents: set[str] = set()
         self.counters = {
             "accepted": 0, "duplicate": 0, "out_of_order": 0,
             "unknown_bus": 0, "bad_schema": 0, "notifications": 0,
@@ -110,6 +113,14 @@ class Tracker:
             return "unknown_bus"
         if p.event_id in st.seen_set:
             return "duplicate"
+        new_trip = st.trip_id is not None and p.trip_id != st.trip_id
+        if new_trip:
+            if st.last_ts is not None and p.ts < st.last_ts:
+                return "out_of_order"            # straggler from an older trip
+            # New trip: the device's seq counter restarts, so reset trip state.
+            st.trip_id, st.d, st.next_stop_idx, st.finished = p.trip_id, 0.0, 0, False
+            st.last_seq, st.speed_est, st.last_ts = -1, None, None   # no speed across trips
+            st.notified.clear()
         if p.seq <= st.last_seq:
             # Older than something already applied. Applying it would move the
             # bus backwards and corrupt the speed estimate, so drop it.
@@ -117,14 +128,14 @@ class Tracker:
             return "out_of_order"
 
         self._remember(st, p.event_id)
-        if st.trip_id != p.trip_id:          # new trip: reset trip-scoped state
-            st.trip_id, st.d, st.next_stop_idx, st.finished = p.trip_id, 0.0, 0, False
-            st.notified.clear()
-            st.speed_est = None
+        st.trip_id = p.trip_id
+        self._dirty.add(st.bus_id)
 
         line = self.lines[st.route_id]
         x, y = self.frame.to_xy(p.lat, p.lon)
         dt = (p.ts - st.last_ts) if st.last_ts is not None else None
+        if dt is not None and not new_trip:
+            self._record_gap(st, p.ts)
         window = (dt or 60.0) * MAX_SPEED_MPS + 50.0
         d_proj, _off = line.project(x, y, d_min=max(0.0, st.d - 30.0), d_max=st.d + window)
         new_d = max(st.d, d_proj)            # buses don't reverse on a route
@@ -183,47 +194,117 @@ class Tracker:
                 continue
             if eta - now <= self.notify_lead_s:
                 st.notified.add(stop_id)
-                self.notifications.append(Notification(
-                    bus_id=st.bus_id, trip_id=st.trip_id or "", stop_id=stop_id,
-                    sent_ts=now, predicted_arrival_ts=eta))
+                n = Notification(bus_id=st.bus_id, trip_id=st.trip_id or "", stop_id=stop_id,
+                                 sent_ts=now, predicted_arrival_ts=eta)
+                self.notifications.append(n)
+                self._new_notifications.append(n)
                 self.counters["notifications"] += 1
 
     # --------------------------------------------------------------- incidents
-    def check_stale(self, now: float) -> list[Incident]:
-        """Open a GPS_LOST incident for any active bus silent too long."""
+    def check_stale(self, now: float | Callable[[str], float]) -> list[Incident]:
+        """Open a GPS_LOST incident for any active bus silent too long.
+
+        `now` is event time. It can be one number, or a function giving the
+        event time to judge each bus against (a Kafka consumer reads several
+        partitions that progress at different speeds, so 'now' differs per bus).
+        """
         opened = []
         for st in self.buses.values():
             if st.last_ts is None or st.finished or st.bus_id in self._open_incident:
                 continue
-            if now - st.last_ts > self.gps_lost_after_s:
-                iid = f"INC-{next(self._incident_ids):05d}"
+            bus_now = now(st.bus_id) if callable(now) else now
+            if bus_now - st.last_ts > self.gps_lost_after_s:
+                # Deterministic id: a replay after a crash produces the same id,
+                # so the database can de-duplicate it.
+                iid = f"INC-{st.bus_id}-{st.trip_id}-{int(st.last_ts)}"
                 inc = Incident(incident_id=iid, type=IncidentType.GPS_LOST, bus_id=st.bus_id,
-                               opened_ts=now, detail=f"no GPS for {now - st.last_ts:.0f}s")
+                               opened_ts=bus_now, detail=f"no GPS for {bus_now - st.last_ts:.0f}s")
                 self.incidents[iid] = inc
                 self._open_incident[st.bus_id] = iid
+                self._dirty_incidents.add(iid)
                 opened.append(inc)
         return opened
+
+    def _record_gap(self, st: BusState, ping_ts: float) -> None:
+        """A ping arrived after a silence longer than the GPS-loss threshold.
+
+        If no incident is open yet (the periodic check never ran inside the
+        gap, e.g. a consumer catching up on a backlog in large batches), record
+        it now, already closed. Detection then does not depend on how often
+        check_stale() happens to run. Same id as check_stale() would use."""
+        if st.bus_id in self._open_incident or st.finished:
+            return
+        if ping_ts - st.last_ts <= self.gps_lost_after_s:
+            return
+        iid = f"INC-{st.bus_id}-{st.trip_id}-{int(st.last_ts)}"
+        if iid in self.incidents:
+            return
+        opened = st.last_ts + self.gps_lost_after_s
+        self.incidents[iid] = Incident(incident_id=iid, type=IncidentType.GPS_LOST, bus_id=st.bus_id,
+                                       opened_ts=opened, closed_ts=ping_ts,
+                                       detail=f"no GPS for {ping_ts - st.last_ts:.0f}s (found on resume)")
+        self._dirty_incidents.add(iid)
 
     def _close_gps_lost(self, st: BusState, now: float) -> None:
         iid = self._open_incident.pop(st.bus_id, None)
         if iid:
             self.incidents[iid].closed_ts = now
+            self._dirty_incidents.add(iid)
 
     # ------------------------------------------------------------------- views
     def snapshot(self) -> list[dict]:
         out = []
         for st in self.buses.values():
-            stops = self.routes[st.route_id].stops
-            nxt = stops[st.next_stop_idx] if st.next_stop_idx < len(stops) else None
-            etas = self.etas(st.bus_id)
             out.append({
                 "bus_id": st.bus_id, "route_id": st.route_id, "trip_id": st.trip_id,
                 "lat": st.lat, "lon": st.lon, "last_ts": st.last_ts,
                 "progress_m": round(st.d, 1),
                 "speed_est_mps": None if st.speed_est is None else round(st.speed_est, 2),
-                "next_stop": nxt.stop_id if nxt else None,
-                "next_stop_eta_ts": etas.get(nxt.stop_id) if nxt else None,
                 "finished": st.finished,
-                "gps_lost": st.bus_id in self._open_incident,
+                **self._next_stop_view(st),
             })
         return out
+
+    # ------------------------------------------------------- persistence hooks
+    def drain_changes(self) -> tuple[list[dict], list[Notification], list[Incident]]:
+        """Return everything changed since the last drain, and reset."""
+        buses = [self.export_bus(b) for b in sorted(self._dirty)]
+        notes, self._new_notifications = self._new_notifications, []
+        incs = [self.incidents[i] for i in sorted(self._dirty_incidents)]
+        self._dirty, self._dirty_incidents = set(), set()
+        return buses, notes, incs
+
+    def export_bus(self, bus_id: str) -> dict:
+        st = self.buses[bus_id]
+        return {
+            "bus_id": st.bus_id, "route_id": st.route_id, "trip_id": st.trip_id,
+            "last_seq": st.last_seq, "last_ts": st.last_ts, "lat": st.lat, "lon": st.lon,
+            "d": st.d, "speed_est": st.speed_est, "next_stop_idx": st.next_stop_idx,
+            "finished": st.finished, "notified": sorted(st.notified),
+            # derived, for read models; ignored by restore()
+            **self._next_stop_view(st),
+        }
+
+    def _next_stop_view(self, st: BusState) -> dict:
+        stops = self.routes[st.route_id].stops
+        nxt = stops[st.next_stop_idx] if st.next_stop_idx < len(stops) else None
+        return {
+            "next_stop": nxt.stop_id if nxt else None,
+            "next_stop_eta_ts": self.etas(st.bus_id).get(nxt.stop_id) if nxt else None,
+            "gps_lost": st.bus_id in self._open_incident,
+        }
+
+    def restore(self, buses: list[dict], open_incidents: list[Incident]) -> None:
+        """Rebuild state after a restart. The dedup window is not persisted;
+        last_seq alone is enough to reject anything already applied."""
+        for row in buses:
+            st = self.buses.get(row["bus_id"])
+            if st is None:
+                continue
+            st.trip_id, st.last_seq, st.last_ts = row["trip_id"], row["last_seq"], row["last_ts"]
+            st.lat, st.lon, st.d, st.speed_est = row["lat"], row["lon"], row["d"], row["speed_est"]
+            st.next_stop_idx, st.finished = row["next_stop_idx"], row["finished"]
+            st.notified = set(row["notified"])
+        for inc in open_incidents:
+            self.incidents[inc.incident_id] = inc
+            self._open_incident[inc.bus_id] = inc.incident_id

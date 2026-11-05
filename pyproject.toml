@@ -6,11 +6,11 @@ build-backend = "setuptools.build_meta"
 include = ["fleetops*"]
 
 [tool.setuptools.package-data]
-fleetops = ["static/*.html", "static/vendor/leaflet/*", "static/vendor/leaflet/images/*"]
+fleetops = ["migrations/*.sql", "static/*.html", "static/vendor/leaflet/*", "static/vendor/leaflet/images/*"]
 
 [project]
 name = "fleetops"
-version = "0.1.0"
+version = "0.2.0"
 description = "Real-time school bus tracking and parent ETA pipeline (portfolio project, synthetic data only)"
 requires-python = ">=3.11"
 dependencies = [
@@ -18,6 +18,8 @@ dependencies = [
   "fastapi>=0.110",
   "uvicorn>=0.27",
   "prometheus-client>=0.20",
+  "psycopg[binary]>=3.2",
+  "kafka-python>=2.1",
 ]
 
 [project.optional-dependencies]

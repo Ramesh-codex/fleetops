@@ -37,9 +37,9 @@
     <div class="stat"><b id="s-active">–</b><span class="sub">active</span></div>
     <div class="stat"><b id="s-alerts">–</b><span class="sub">alerts</span></div>
     <div class="stat"><b id="s-lost">–</b><span class="sub">GPS lost</span></div>
-    <div class="stat"><b id="s-acc">–</b><span class="sub">accepted</span></div>
-    <div class="stat"><b id="s-dup">–</b><span class="sub">dup dropped</span></div>
-    <div class="stat"><b id="s-ooo">–</b><span class="sub">late dropped</span></div>
+    <div class="stat"><b id="s-acc">–</b><span class="sub" id="l-acc">accepted</span></div>
+    <div class="stat"><b id="s-dup">–</b><span class="sub" id="l-dup">dup dropped</span></div>
+    <div class="stat"><b id="s-ooo">–</b><span class="sub" id="l-ooo">late dropped</span></div>
   </div>
   <h2>Buses</h2><div id="buses"></div>
   <h2>Parent alerts</h2><div id="alerts"></div>
@@ -84,14 +84,24 @@ async function tick() {
     const [health, b, alerts, incs, stats] = await Promise.all(
       [j('/health'), j('/buses'), j('/notifications?limit=12'), j('/incidents'), j('/stats')]);
     await drawRoutes(health.run);
-    document.getElementById('clock').textContent = `sim ${fmt(b.sim_now)} · run ${health.run}`;
-    const c = stats.counters;
+    document.getElementById('clock').textContent = `sim ${fmt(b.sim_now)} · ${health.mode === 'db' ? 'Kafka pipeline' : 'run ' + health.run}`;
+    const c = stats.counters, v = k => (c[k] ?? '–');
     document.getElementById('s-active').textContent = b.buses.filter(x => !x.finished).length;
-    document.getElementById('s-alerts').textContent = c.notifications;
+    document.getElementById('s-alerts').textContent = v('notifications');
     document.getElementById('s-lost').textContent = b.buses.filter(x => x.gps_lost).length;
-    document.getElementById('s-acc').textContent = c.accepted;
-    document.getElementById('s-dup').textContent = c.duplicate;
-    document.getElementById('s-ooo').textContent = c.out_of_order;
+    if (health.mode === 'db') {
+      // Pipeline mode: ingestion counters live in the consumer's metrics, so show stored totals.
+      document.getElementById('l-acc').textContent = 'incidents';
+      document.getElementById('l-dup').textContent = 'dead letters';
+      document.getElementById('l-ooo').textContent = 'mode';
+      document.getElementById('s-acc').textContent = v('incidents');
+      document.getElementById('s-dup').textContent = v('dead_letters');
+      document.getElementById('s-ooo').textContent = 'Kafka';
+    } else {
+      document.getElementById('s-acc').textContent = v('accepted');
+      document.getElementById('s-dup').textContent = v('duplicate');
+      document.getElementById('s-ooo').textContent = v('out_of_order');
+    }
 
     let html = '';
     for (const x of b.buses) {

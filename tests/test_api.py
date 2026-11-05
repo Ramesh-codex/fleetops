@@ -35,3 +35,11 @@ def test_post_ping_validates_input():
     with TestClient(api.app) as c:
         r = c.post("/pings", json={"bus_id": "BUS-101"})
         assert r.status_code == 422
+
+
+def test_stops_near_demo_mode():
+    with TestClient(api.app) as c:
+        s = next(iter(api.rt.sim.routes.values())).stops[1]
+        near = c.get(f"/stops/near?lat={s.lat}&lon={s.lon}&radius_m=50").json()
+        assert near[0]["stop_id"] == s.stop_id
+        assert c.get("/stops/near?lat=200&lon=0").status_code == 422

@@ -1,3 +1,3 @@
-"""FleetOps — real-time school bus tracking and parent ETA pipeline (v0.1)."""
+"""FleetOps — real-time school bus tracking and parent ETA pipeline."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
