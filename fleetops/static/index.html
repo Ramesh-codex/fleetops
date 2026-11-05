@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FleetOps Live</title>
+<link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css">
+<script src="/static/vendor/leaflet/leaflet.js"></script>
+<style>
+  :root { --bg:#f6f7f9; --panel:#fff; --ink:#1b1f24; --muted:#6a7380; --line:#e3e6ea;
+          --ok:#1f8a4c; --warn:#c77700; --bad:#c62828; --accent:#2457d6; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.4 system-ui, -apple-system, Segoe UI, sans-serif; color:var(--ink); background:var(--bg);
+         display:grid; grid-template-columns: 1fr 360px; height:100vh; }
+  #map { height:100vh; }
+  aside { background:var(--panel); border-left:1px solid var(--line); overflow:auto; padding:16px; }
+  h1 { font-size:16px; margin:0 0 4px; } h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em;
+       color:var(--muted); margin:18px 0 8px; }
+  .sub { color:var(--muted); font-size:12px; }
+  .stats { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-top:12px; }
+  .stat { border:1px solid var(--line); border-radius:8px; padding:8px; }
+  .stat b { display:block; font-size:18px; font-variant-numeric: tabular-nums; }
+  .row { display:flex; justify-content:space-between; gap:8px; padding:6px 0; border-bottom:1px solid var(--line); font-size:13px; }
+  .row > span:last-child { color:var(--muted); font-variant-numeric: tabular-nums; text-align:right; }
+  .pill { font-size:11px; padding:1px 6px; border-radius:99px; color:#fff; }
+  .ok{background:var(--ok)} .warn{background:var(--warn)} .bad{background:var(--bad)} .done{background:var(--muted)}
+  @media (max-width: 800px) { body { grid-template-columns: 1fr; grid-template-rows: 55vh auto; height:auto; }
+    #map { height:55vh; } aside { border-left:0; border-top:1px solid var(--line); } }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<aside>
+  <h1>FleetOps Live</h1>
+  <div class="sub">Synthetic fleet · <span id="clock">–</span></div>
+  <div class="stats">
+    <div class="stat"><b id="s-active">–</b><span class="sub">active</span></div>
+    <div class="stat"><b id="s-alerts">–</b><span class="sub">alerts</span></div>
+    <div class="stat"><b id="s-lost">–</b><span class="sub">GPS lost</span></div>
+    <div class="stat"><b id="s-acc">–</b><span class="sub">accepted</span></div>
+    <div class="stat"><b id="s-dup">–</b><span class="sub">dup dropped</span></div>
+    <div class="stat"><b id="s-ooo">–</b><span class="sub">late dropped</span></div>
+  </div>
+  <h2>Buses</h2><div id="buses"></div>
+  <h2>Parent alerts</h2><div id="alerts"></div>
+  <h2>Incidents</h2><div id="incidents"></div>
+</aside>
+<script>
+const map = L.map('map').setView([37.3382, -121.8863], 13);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+  { maxZoom: 18, attribution: '&copy; OpenStreetMap contributors' }).addTo(map);
+const markers = {}; let routesLayer = null; let routesRun = null;
+const fmt = ts => ts ? new Date(ts * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'}) : '–';
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+async function j(u) { const r = await fetch(u); return r.json(); }
+
+async function drawRoutes(run) {
+  if (routesRun === run) return;
+  routesRun = run;
+  if (routesLayer) routesLayer.remove();
+  routesLayer = L.layerGroup().addTo(map);
+  const routes = await j('/routes'); const all = [];
+  for (const r of routes) {
+    L.polyline(r.path, { color: '#2457d6', weight: 3, opacity: .35 }).addTo(routesLayer);
+    for (const s of r.stops) {
+      all.push([s.lat, s.lon]);
+      L.circleMarker([s.lat, s.lon], { radius: s.name === 'School' ? 6 : 3, color: '#2457d6', weight: 1, fillOpacity: .8 })
+        .bindTooltip(`${esc(r.name)} · ${esc(s.name)}`).addTo(routesLayer);
+    }
+  }
+  if (all.length) map.fitBounds(all, { padding: [30, 30] });
+}
+
+function status(b) {
+  if (b.finished) return ['done', 'arrived'];
+  if (b.gps_lost) return ['bad', 'GPS lost'];
+  if (b.speed_est_mps !== null && b.speed_est_mps < 2) return ['warn', 'slow'];
+  return ['ok', 'moving'];
+}
+
+async function tick() {
+  try {
+    const [health, b, alerts, incs, stats] = await Promise.all(
+      [j('/health'), j('/buses'), j('/notifications?limit=12'), j('/incidents'), j('/stats')]);
+    await drawRoutes(health.run);
+    document.getElementById('clock').textContent = `sim ${fmt(b.sim_now)} · run ${health.run}`;
+    const c = stats.counters;
+    document.getElementById('s-active').textContent = b.buses.filter(x => !x.finished).length;
+    document.getElementById('s-alerts').textContent = c.notifications;
+    document.getElementById('s-lost').textContent = b.buses.filter(x => x.gps_lost).length;
+    document.getElementById('s-acc').textContent = c.accepted;
+    document.getElementById('s-dup').textContent = c.duplicate;
+    document.getElementById('s-ooo').textContent = c.out_of_order;
+
+    let html = '';
+    for (const x of b.buses) {
+      const [cls, label] = status(x);
+      if (x.lat !== null) {
+        const color = { ok: '#1f8a4c', warn: '#c77700', bad: '#c62828', done: '#6a7380' }[cls];
+        if (!markers[x.bus_id]) markers[x.bus_id] = L.circleMarker([x.lat, x.lon], { radius: 8, weight: 2, fillOpacity: .9 }).addTo(map);
+        markers[x.bus_id].setLatLng([x.lat, x.lon]).setStyle({ color, fillColor: color })
+          .bindTooltip(`${x.bus_id} · ${label}`);
+      }
+      const eta = x.next_stop_eta_ts ? Math.max(0, Math.round((x.next_stop_eta_ts - b.sim_now) / 60)) + ' min' : '';
+      html += `<div class="row"><span>${esc(x.bus_id)} <span class="pill ${cls}">${label}</span></span>
+               <span>${x.next_stop ? esc(x.next_stop) + ' · ' + eta : ''}</span></div>`;
+    }
+    document.getElementById('buses').innerHTML = html;
+    document.getElementById('alerts').innerHTML = alerts.map(n =>
+      `<div class="row"><span>${esc(n.bus_id)} → ${esc(n.stop_id)}</span><span>${fmt(n.sent_ts)}</span></div>`).join('') || '<div class="sub">none yet</div>';
+    document.getElementById('incidents').innerHTML = incs.slice(0, 10).map(i =>
+      `<div class="row"><span>${esc(i.type)} · ${esc(i.bus_id)} <span class="pill ${i.closed_ts ? 'done' : 'bad'}">${i.closed_ts ? 'closed' : 'open'}</span></span>
+       <span>${fmt(i.opened_ts)}</span></div>`).join('') || '<div class="sub">none</div>';
+  } catch (e) { console.error(e); }
+}
+tick(); setInterval(tick, 1000);
+</script>
+</body>
+</html>

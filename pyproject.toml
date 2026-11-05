@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["fleetops*"]
+
+[tool.setuptools.package-data]
+fleetops = ["static/*.html", "static/vendor/leaflet/*", "static/vendor/leaflet/images/*"]
+
+[project]
+name = "fleetops"
+version = "0.1.0"
+description = "Real-time school bus tracking and parent ETA pipeline (portfolio project, synthetic data only)"
+requires-python = ">=3.11"
+dependencies = [
+  "pydantic>=2.6",
+  "fastapi>=0.110",
+  "uvicorn>=0.27",
+  "prometheus-client>=0.20",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "httpx>=0.27"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

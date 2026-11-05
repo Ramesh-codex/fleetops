@@ -1,0 +1,10 @@
+services:
+  tracker:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      FLEETOPS_SEED: "42"
+      FLEETOPS_BUSES: "12"
+      FLEETOPS_SPEEDUP: "10"
+      FLEETOPS_FAULTS: "1"
