@@ -66,8 +66,18 @@ SCENARIOS = {
 }
 
 
+APPROACH = ("BUS_APPROACHING", "APPROACHING_AFTER_DELAY")
+
+
 def eval_eta(scenario: dict, **tracker_kw):
-    leads, eta_err_5min = [], []
+    """Score what each parent was last told before the bus actually arrived.
+
+    For every (trip, stop) that got an alert: take the parent's LAST message
+    sent before arrival. If it is an "approaching" alert, its lead time counts
+    (early = more than 10 min before arrival). If it is a "delayed" update, the
+    parent was correctly told not to go out yet, so it does not count as early.
+    """
+    leads, eta_err_5min, early, scored, false_bd = [], [], 0, 0, 0
     for seed in SEEDS:
         r = simulate(SimConfig(seed=seed, n_buses=30, **scenario))
         t = Tracker(r.routes, r.frame, r.bus_route, **tracker_kw)
@@ -75,24 +85,31 @@ def eval_eta(scenario: dict, **tracker_kw):
         for p in r.pings:
             first_ping.setdefault(p.bus_id, p.ts)
             t.ingest(p)
-            # Score every prediction made while the bus is 4-6 min from a stop.
             for stop_id, eta in t.etas(p.bus_id).items():
                 actual = r.truth_arrival[(p.bus_id, stop_id)]
                 if 240 <= actual - p.ts <= 360:
                     eta_err_5min.append(eta - actual)
-        # Score only stops that were more than 6 min away when tracking began.
-        # Nearer stops get an immediate "bus is on its way" alert by design.
+        false_bd += sum(1 for i in t.incidents.values()
+                        if i.type == "BREAKDOWN_SUSPECTED" and i.bus_id not in r.breakdowns)
+        last: dict[tuple[str, str], object] = {}
         for n in t.notifications:
             actual = r.truth_arrival[(n.bus_id, n.stop_id)]
-            if actual - first_ping[n.bus_id] > LEAD_TARGET + 60:
-                leads.append(actual - n.sent_ts)
+            if n.sent_ts <= actual and actual - first_ping[n.bus_id] > LEAD_TARGET + 60:
+                last[(n.bus_id, n.stop_id)] = n
+        for (bus, stop), n in last.items():
+            scored += 1
+            if n.kind in APPROACH:
+                lead = r.truth_arrival[(bus, stop)] - n.sent_ts
+                leads.append(lead)
+                early += lead > 2 * LEAD_TARGET
     return {
-        "alerts": len(leads),
+        "alerts": scored,
         "lead_p50": pct(leads, 50),
-        "late_pct": 100 * sum(l < LATE_LEAD for l in leads) / len(leads),
-        "early_pct": 100 * sum(l > 2 * LEAD_TARGET for l in leads) / len(leads),
+        "late_pct": 100 * sum(l < LATE_LEAD for l in leads) / max(1, scored),
+        "early_pct": 100 * early / max(1, scored),
         "mae_5min": statistics.mean(abs(e) for e in eta_err_5min),
         "bias_5min": statistics.mean(eta_err_5min),
+        "false_bd": false_bd,
     }
 
 
@@ -137,20 +154,24 @@ def main():
               f"| {tp['pings_per_s']:,.0f} | {tp['p50_us']:.1f} µs | {tp['p99_us']:.1f} µs |", ""]
 
     lines += ["## 2. Parent alert quality (target: alert ~5 min before arrival)", "",
-              "`lead` = real arrival − alert time. `late` = under 2 min warning. "
-              "`early` = over 10 min warning. ETA MAE scored on predictions made 4–6 min out.", "",
-              "| scenario | ETA method | scored alerts | median lead | late % | early % | ETA MAE (5 min out) | ETA bias |",
-              "|---|---|---|---|---|---|---|---|"]
+              "Scored on the LAST message each parent got before the bus arrived. `lead` = real arrival − "
+              "alert time. `late` = under 2 min warning. `early` = last message was an alert sent over "
+              "10 min early (a 'delayed' update correctly cancels it). ETA MAE scored on predictions "
+              "made 4–6 min out. `false breakdowns` = breakdown incidents for buses that never broke down.", "",
+              "| scenario | method | scored stops | median lead | late % | early % | ETA MAE (5 min out) | ETA bias | false breakdowns |",
+              "|---|---|---|---|---|---|---|---|---|"]
+    off = float("inf")      # breakdown detection disabled
     variants = [
-        ("naive", dict(eta_mode="naive", require_warmup=False)),
-        ("moving, no warmup", dict(eta_mode="moving", require_warmup=False)),
-        ("moving + warmup", dict(eta_mode="moving", require_warmup=True)),
+        ("naive", dict(eta_mode="naive", require_warmup=False, breakdown_after_s=off)),
+        ("moving, no warmup", dict(eta_mode="moving", require_warmup=False, breakdown_after_s=off)),
+        ("moving + warmup", dict(eta_mode="moving", require_warmup=True, breakdown_after_s=off)),
+        ("+ breakdown updates", dict(eta_mode="moving", require_warmup=True)),
     ]
     for name, sc in SCENARIOS.items():
         for label, kw in variants:
             e = eval_eta(sc, **kw)
             lines.append(f"| {name} | {label} | {e['alerts']} | {e['lead_p50']:.0f} s | {e['late_pct']:.1f}% | "
-                         f"{e['early_pct']:.1f}% | {e['mae_5min']:.0f} s | {e['bias_5min']:+.0f} s |")
+                         f"{e['early_pct']:.1f}% | {e['mae_5min']:.0f} s | {e['bias_5min']:+.0f} s | {e['false_bd']} |")
     lines += ["", "ETA bias = mean(predicted - actual arrival). Positive = on average the ETA "
               "says the bus is later than it really is. Note an alert fires on the FIRST "
               "prediction under 5 min, so a noisy estimator can be late on average yet still alert early.", ""]

@@ -74,6 +74,7 @@ async function drawRoutes(run) {
 
 function status(b) {
   if (b.finished) return ['done', 'arrived'];
+  if (b.breakdown) return ['bad', 'breakdown'];
   if (b.gps_lost) return ['bad', 'GPS lost'];
   if (b.speed_est_mps !== null && b.speed_est_mps < 2) return ['warn', 'slow'];
   return ['ok', 'moving'];
@@ -117,8 +118,12 @@ async function tick() {
                <span>${x.next_stop ? esc(x.next_stop) + ' · ' + eta : ''}</span></div>`;
     }
     document.getElementById('buses').innerHTML = html;
-    document.getElementById('alerts').innerHTML = alerts.map(n =>
-      `<div class="row"><span>${esc(n.bus_id)} → ${esc(n.stop_id)}</span><span>${fmt(n.sent_ts)}</span></div>`).join('') || '<div class="sub">none yet</div>';
+    const kindLabel = { DELAY_UPDATE: ['bad', 'delayed'], APPROACHING_AFTER_DELAY: ['warn', 'back on way'] };
+    document.getElementById('alerts').innerHTML = alerts.map(n => {
+      const k = kindLabel[n.kind];
+      const pill = k ? ` <span class="pill ${k[0]}">${k[1]}</span>` : '';
+      return `<div class="row"><span>${esc(n.bus_id)} → ${esc(n.stop_id)}${pill}</span><span>${fmt(n.sent_ts)}</span></div>`;
+    }).join('') || '<div class="sub">none yet</div>';
     document.getElementById('incidents').innerHTML = incs.slice(0, 10).map(i =>
       `<div class="row"><span>${esc(i.type)} · ${esc(i.bus_id)} <span class="pill ${i.closed_ts ? 'done' : 'bad'}">${i.closed_ts ? 'closed' : 'open'}</span></span>
        <span>${fmt(i.opened_ts)}</span></div>`).join('') || '<div class="sub">none</div>';

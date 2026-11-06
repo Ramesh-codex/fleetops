@@ -74,8 +74,9 @@ def test_real_kafka_crash_recovery_no_duplicate_alerts(conn):
     ref = Tracker(sim.routes, sim.frame, sim.bus_route)
     for p in pings:
         ref.ingest(p)
-    want = {(n.trip_id, n.stop_id) for n in ref.notifications}
-    got = [(r["trip_id"], r["stop_id"]) for r in conn.execute("SELECT trip_id, stop_id FROM notifications")]
+    want = {(n.trip_id, n.stop_id, n.kind) for n in ref.notifications}
+    got = [(r["trip_id"], r["stop_id"], r["kind"])
+           for r in conn.execute("SELECT trip_id, stop_id, kind FROM notifications")]
 
     assert committed >= len(pings)
     assert crashes >= 1

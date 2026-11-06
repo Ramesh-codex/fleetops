@@ -12,6 +12,7 @@ from pathlib import Path
 
 import psycopg
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
 from .models import Incident, IncidentType, Notification, Route, Stop
 
@@ -92,9 +93,11 @@ def load_routes(conn: psycopg.Connection) -> tuple[dict[str, Route], dict[str, s
 # ------------------------------------------------------------------ write path
 _UPSERT_BUS = """
 INSERT INTO bus_state (bus_id, trip_id, last_seq, last_ts, d, speed_est, next_stop_idx, finished,
-                       notified, next_stop, next_stop_eta_ts, gps_lost, geom, updated_at)
+                       notified, next_stop, next_stop_eta_ts, gps_lost, delayed, motion, bd_anchor_d,
+                       breakdown, geom, updated_at)
 VALUES (%(bus_id)s, %(trip_id)s, %(last_seq)s, %(last_ts)s, %(d)s, %(speed_est)s, %(next_stop_idx)s,
         %(finished)s, %(notified)s, %(next_stop)s, %(next_stop_eta_ts)s, %(gps_lost)s,
+        %(delayed)s, %(motion)s, %(bd_anchor_d)s, %(breakdown)s,
         CASE WHEN %(lat)s::float8 IS NULL THEN NULL
              ELSE ST_SetSRID(ST_MakePoint(%(lon)s::float8, %(lat)s::float8), 4326) END,
         now())
@@ -103,12 +106,13 @@ ON CONFLICT (bus_id) DO UPDATE SET
     d = EXCLUDED.d, speed_est = EXCLUDED.speed_est, next_stop_idx = EXCLUDED.next_stop_idx,
     finished = EXCLUDED.finished, notified = EXCLUDED.notified, next_stop = EXCLUDED.next_stop,
     next_stop_eta_ts = EXCLUDED.next_stop_eta_ts, gps_lost = EXCLUDED.gps_lost,
-    geom = EXCLUDED.geom, updated_at = now()
+    delayed = EXCLUDED.delayed, motion = EXCLUDED.motion, bd_anchor_d = EXCLUDED.bd_anchor_d,
+    breakdown = EXCLUDED.breakdown, geom = EXCLUDED.geom, updated_at = now()
 """
 
 _INSERT_NOTE = """
-INSERT INTO notifications (bus_id, trip_id, stop_id, sent_ts, predicted_arrival_ts)
-VALUES (%s, %s, %s, %s, %s) ON CONFLICT (trip_id, stop_id) DO NOTHING
+INSERT INTO notifications (kind, bus_id, trip_id, stop_id, sent_ts, predicted_arrival_ts)
+VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (trip_id, stop_id, kind) DO NOTHING
 """
 
 _UPSERT_INCIDENT = """
@@ -130,9 +134,10 @@ def save_batch(conn: psycopg.Connection, buses: list[dict], notes: list[Notifica
     with conn.transaction():
         with conn.cursor() as cur:
             if buses:
-                cur.executemany(_UPSERT_BUS, buses)
+                cur.executemany(_UPSERT_BUS, [{**b, "motion": Jsonb(b["motion"])} for b in buses])
             for n in notes:
-                cur.execute(_INSERT_NOTE, (n.bus_id, n.trip_id, n.stop_id, n.sent_ts, n.predicted_arrival_ts))
+                cur.execute(_INSERT_NOTE, (n.kind, n.bus_id, n.trip_id, n.stop_id, n.sent_ts,
+                                           n.predicted_arrival_ts))
                 rejected += cur.rowcount == 0
             if incidents:
                 cur.executemany(_UPSERT_INCIDENT, [
@@ -149,7 +154,7 @@ def save_batch(conn: psycopg.Connection, buses: list[dict], notes: list[Notifica
 def load_state(conn: psycopg.Connection) -> tuple[list[dict], list[Incident]]:
     buses = list(conn.execute(
         "SELECT bus_id, trip_id, last_seq, last_ts, d, speed_est, next_stop_idx, finished, notified, "
-        "ST_Y(geom) AS lat, ST_X(geom) AS lon FROM bus_state"))
+        "delayed, motion, bd_anchor_d, ST_Y(geom) AS lat, ST_X(geom) AS lon FROM bus_state"))
     incs = [Incident(incident_id=r["incident_id"], type=IncidentType(r["type"]), bus_id=r["bus_id"],
                      opened_ts=r["opened_ts"], closed_ts=r["closed_ts"], detail=r["detail"])
             for r in conn.execute("SELECT * FROM incidents WHERE closed_ts IS NULL")]
@@ -168,13 +173,13 @@ def q_buses(conn) -> list[dict]:
         "SELECT b.bus_id, b.route_id, s.trip_id, ST_Y(s.geom) AS lat, ST_X(s.geom) AS lon, s.last_ts, "
         "round(s.d::numeric, 1)::float8 AS progress_m, round(s.speed_est::numeric, 2)::float8 AS speed_est_mps, "
         "COALESCE(s.finished, false) AS finished, s.next_stop, s.next_stop_eta_ts, "
-        "COALESCE(s.gps_lost, false) AS gps_lost "
+        "COALESCE(s.gps_lost, false) AS gps_lost, COALESCE(s.breakdown, false) AS breakdown "
         "FROM buses b LEFT JOIN bus_state s USING (bus_id) ORDER BY b.bus_id"))
 
 
 def q_notifications(conn, limit: int) -> list[dict]:
     return list(conn.execute(
-        "SELECT bus_id, trip_id, stop_id, sent_ts, predicted_arrival_ts FROM notifications "
+        "SELECT kind, bus_id, trip_id, stop_id, sent_ts, predicted_arrival_ts FROM notifications "
         "ORDER BY id DESC LIMIT %s", (limit,)))
 
 

@@ -9,23 +9,26 @@ Seeds: [1, 2, 3, 4, 5]. Synthetic data only.
 
 | pings/sec | p50 per ping | p99 per ping |
 |---|---|---|
-| 95,573 | 10.7 µs | 19.3 µs |
+| 82,846 | 12.1 µs | 24.8 µs |
 
 ## 2. Parent alert quality (target: alert ~5 min before arrival)
 
-`lead` = real arrival − alert time. `late` = under 2 min warning. `early` = over 10 min warning. ETA MAE scored on predictions made 4–6 min out.
+Scored on the LAST message each parent got before the bus arrived. `lead` = real arrival − alert time. `late` = under 2 min warning. `early` = last message was an alert sent over 10 min early (a 'delayed' update correctly cancels it). ETA MAE scored on predictions made 4–6 min out. `false breakdowns` = breakdown incidents for buses that never broke down.
 
-| scenario | ETA method | scored alerts | median lead | late % | early % | ETA MAE (5 min out) | ETA bias |
-|---|---|---|---|---|---|---|---|
-| clean | naive | 829 | 433 s | 0.0% | 0.4% | 272 s | +198 s |
-| clean | moving, no warmup | 829 | 306 s | 0.0% | 0.0% | 57 s | +35 s |
-| clean | moving + warmup | 829 | 305 s | 0.0% | 0.0% | 57 s | +35 s |
-| traffic | naive | 973 | 533 s | 0.0% | 30.4% | 208 s | +136 s |
-| traffic | moving, no warmup | 973 | 376 s | 0.2% | 2.6% | 104 s | +34 s |
-| traffic | moving + warmup | 973 | 351 s | 0.2% | 2.3% | 104 s | +34 s |
-| breakdowns | naive | 908 | 531 s | 0.0% | 40.2% | 269 s | +192 s |
-| breakdowns | moving, no warmup | 908 | 364 s | 0.0% | 25.8% | 112 s | +13 s |
-| breakdowns | moving + warmup | 908 | 347 s | 0.1% | 25.8% | 112 s | +13 s |
+| scenario | method | scored stops | median lead | late % | early % | ETA MAE (5 min out) | ETA bias | false breakdowns |
+|---|---|---|---|---|---|---|---|---|
+| clean | naive | 829 | 433 s | 0.0% | 0.4% | 272 s | +198 s | 0 |
+| clean | moving, no warmup | 829 | 306 s | 0.0% | 0.0% | 57 s | +35 s | 0 |
+| clean | moving + warmup | 829 | 305 s | 0.0% | 0.0% | 57 s | +35 s | 0 |
+| clean | + breakdown updates | 829 | 305 s | 0.0% | 0.0% | 57 s | +35 s | 0 |
+| traffic | naive | 973 | 533 s | 0.0% | 30.4% | 208 s | +136 s | 0 |
+| traffic | moving, no warmup | 973 | 376 s | 0.2% | 2.6% | 104 s | +34 s | 0 |
+| traffic | moving + warmup | 973 | 351 s | 0.2% | 2.3% | 104 s | +34 s | 0 |
+| traffic | + breakdown updates | 973 | 351 s | 0.2% | 2.3% | 104 s | +34 s | 0 |
+| breakdowns | naive | 908 | 531 s | 0.0% | 40.2% | 269 s | +192 s | 0 |
+| breakdowns | moving, no warmup | 908 | 364 s | 0.0% | 25.8% | 112 s | +13 s | 0 |
+| breakdowns | moving + warmup | 908 | 347 s | 0.1% | 25.8% | 112 s | +13 s | 0 |
+| breakdowns | + breakdown updates | 908 | 299 s | 10.2% | 0.3% | 103 s | +41 s | 0 |
 
 ETA bias = mean(predicted - actual arrival). Positive = on average the ETA says the bus is later than it really is. Note an alert fires on the FIRST prediction under 5 min, so a noisy estimator can be late on average yet still alert early.
 

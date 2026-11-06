@@ -6,8 +6,9 @@ GPS-loss incidents for dispatchers.
 
 > Independent project. Synthetic data only — no real routes, students, or company systems.
 
-**Status: v0.2** — Kafka ingestion, PostgreSQL/PostGIS persistence, crash-safe consumer,
-dead-letter handling, Prometheus + Grafana, on top of the v0.1 tracking core.
+**Status: v0.3 (part 1)** — breakdown detection and parent delay updates, on top of v0.2
+(Kafka, PostgreSQL/PostGIS, crash-safe consumer, dead letters, Prometheus + Grafana).
+Next: an AI recovery agent that proposes a replacement bus for dispatcher approval.
 Nothing below is claimed unless it runs.
 
 ![Live map](docs/screenshot.png)
@@ -39,6 +40,10 @@ database, which is what `uvicorn fleetops.api:app` gives you.
   - Exactly one alert per (trip, stop).
   - Opens a `GPS_LOST` incident after 60 s of silence; closes it when pings resume.
     Finished trips and stopped-but-pinging buses are never flagged.
+  - Opens a `BREAKDOWN_SUSPECTED` incident when a bus that is still pinging makes less
+    than 30 m of progress in a sliding 150 s window. Parents who were already told "about
+    5 minutes" get a **delayed** update, then a fresh alert once the bus is moving and
+    close again. No ETA is shown while a breakdown is open.
 - **Consumer** (`fleetops/consumer.py`) — at-least-once from Kafka, effects applied once.
   Per batch: validate → bad messages to the dead-letter topic and table → good pings to the
   tracker → changed bus state + new alerts + incidents in **one Postgres transaction** →
@@ -124,9 +129,33 @@ a virtual clock (`origin + (wall - origin) * speedup`) that only moves forward, 
 per-start id tag. Regression test restarts the producer mid-day and checks the new trips
 are accepted.
 
-**Known limit:** breakdowns still cause ~26% early alerts — the alert went out before the
-bus broke down, and no ETA model can foresee that. The fix belongs to the next layer:
-detect the breakdown and send parents a "delayed" update (v0.3, incident agent).
+### v0.3 (breakdowns)
+
+**11. Breakdowns left parents with confidently wrong alerts.** In the breakdown scenario,
+25.8% of parents' last message was a "5 minutes away" alert sent over 10 minutes early: the
+alert went out, then the bus broke down. No ETA model can predict that, so the fix is
+detection plus correction: a breakdown incident, a "delayed" update to every parent already
+alerted for a stop ahead, and a fresh alert once the bus moves. Early: 25.8% → 0.3%;
+median lead of the last alert: 347 s → 299 s (target 300); 0 false breakdowns in clean or
+heavy-traffic runs.
+
+**12. Two breakdown detectors that looked right and weren't.** Both were caught by
+comparing incidents against the simulator's ground truth.
+- *15 m "moved" threshold:* route progress only ratchets forward (the max of noisy
+  positions), so a parked bus creeps 10–15 m from GPS noise alone. Incidents closed
+  mid-breakdown and reopened (2 buses got 2 incidents each).
+- *Fixed anchor ("no progress since the last 30 m step"):* the anchor could be set while the
+  bus was still moving, so it stopped ~20 m past it, creep added the rest, the window reset,
+  and detection came 91 s late.
+- Fix: a sliding window ("< 30 m in the last 150 s") plus hysteresis (50 m of progress to
+  end a breakdown). Across 6 seeds and 60 breakdowns: exactly one incident each, detected
+  146–152 s after the stop in the typical case, 0 false positives.
+
+**Known limit:** after a breakdown, stops just past where the bus stopped get their fresh
+alert late (10% of scored stops in the breakdown scenario; 92 of the 93 late alerts are
+these). The earliest anyone can know the bus is coming again is when it moves, and a stop
+1 minute away then gets a 1-minute warning. Those parents have already received the
+"delayed" update, so they are not waiting outside on wrong information.
 
 ## Benchmark (measured, reproducible)
 
@@ -135,7 +164,7 @@ Measured on Windows 11, Python 3.14. Alert-quality and fault results are bit-ide
 
 | | |
 |---|---|
-| Throughput, one in-memory tracker | 95,573 pings/sec, p50 10.7 µs / p99 19.3 µs per ping (300 buses, faults on) |
+| Throughput, one in-memory tracker | 82,846 pings/sec, p50 12.1 µs / p99 24.8 µs per ping (300 buses, faults on) |
 | Faults: 10% duplicates, 10% reordering, dropouts on 30% of trips | 0 duplicate alerts; 53/53 dropouts detected, 53/53 closed on recovery; 150/150 buses finished |
 
 | scenario | ETA method | median alert lead | early alerts (>10 min) | ETA error 4–6 min out |
@@ -146,8 +175,11 @@ Measured on Windows 11, Python 3.14. Alert-quality and fault results are bit-ide
 | heavy traffic | moving + warmup | 351 s | 2.3% | 104 s |
 | breakdowns | naive | 531 s | 40.2% | 269 s |
 | breakdowns | moving + warmup | 347 s | 25.8% | 112 s |
+| breakdowns | + breakdown detection & delay updates | 299 s | 0.3% | 103 s |
 
-Target lead is 300 s. Only stops more than 6 minutes from the trip start are scored.
+Scored on the **last message each parent got before the bus arrived** (a "delayed" update
+cancels an earlier alert). Target lead is 300 s. Only stops more than 6 minutes from the
+trip start are scored. Breakdown detection raised 0 false incidents in every scenario.
 
 ### Pipeline benchmark (Kafka → consumer → Postgres)
 
@@ -208,8 +240,8 @@ Environment variables: `FLEETOPS_MODE` (demo | db), `FLEETOPS_KAFKA`, `FLEETOPS_
 | GET | `/buses` | All buses: position, progress, speed estimate, next stop + ETA, status |
 | GET | `/buses/{id}` | One bus plus ETAs for every stop ahead |
 | GET | `/routes` | Routes and stops |
-| GET | `/notifications` | Recent parent alerts |
-| GET | `/incidents` | GPS_LOST incidents (open and closed) |
+| GET | `/notifications` | Recent parent messages: approaching, delayed, approaching after delay |
+| GET | `/incidents` | GPS_LOST and BREAKDOWN_SUSPECTED incidents (open and closed) |
 | GET | `/stats` | Demo: ingestion counters. DB: stored alerts / incidents / dead letters |
 | GET | `/stops/near?lat=&lon=&radius_m=` | Stops near a point, nearest first (PostGIS in db mode) |
 | POST | `/pings` | Demo mode only: ingest one ping (validated; idempotent) |
@@ -236,7 +268,8 @@ Environment variables: `FLEETOPS_MODE` (demo | db), `FLEETOPS_KAFKA`, `FLEETOPS_
 
 - **v0.2.x** — measure end-to-end latency and lag recovery under a broker restart; run two
   consumers in one group and verify partition rebalancing.
-- **v0.3** — breakdown and delay detection, plus an AI recovery agent with real tools,
-  deterministic plan validation, and dispatcher approval.
+- **v0.3 part 2** — AI recovery agent: on a breakdown it proposes a spare bus using real tools
+  (no invented buses), a deterministic validator checks capacity and ETA, and a dispatcher
+  approves or rejects it. A rule-based planner is used when the LLM is unavailable.
 - **v0.4** — electric bus charging scheduler (depot charger limits, tariff windows,
   state-of-charge constraints; greedy vs OR-Tools).

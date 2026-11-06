@@ -110,7 +110,74 @@ def test_finished_bus_never_flagged_as_gps_lost():
 def test_stopped_but_pinging_bus_is_not_gps_lost():
     r, t = run(SimConfig(seed=20, n_buses=3, breakdown_prob=1.0))
     assert r.breakdowns
-    assert not t.incidents
+    assert not [i for i in t.incidents.values() if i.type == "GPS_LOST"]
+
+
+# ---------------------------------------------------------------- breakdowns
+
+def test_every_breakdown_is_detected_once_and_closed():
+    r, t = run(SimConfig(seed=30, n_buses=8, breakdown_prob=1.0))
+    bd = [i for i in t.incidents.values() if i.type == "BREAKDOWN_SUSPECTED"]
+    assert sorted(i.bus_id for i in bd) == sorted(r.breakdowns)
+    for i in bd:
+        start, end = r.breakdowns[i.bus_id]
+        # The rule is "<30 m progress in the last 150 s". A bus that was standing
+        # at a stop just before it broke down satisfies it sooner, so the lower
+        # bound is below 150 s; the upper bound is the window plus ~2 pings.
+        assert start + 100 <= i.opened_ts <= start + 160
+        assert end <= i.closed_ts <= end + 60                 # until RESUME_M of real progress
+
+
+def test_detection_delay_is_window_length_across_many_breakdowns():
+    """Regression: a fixed anchor detected some breakdowns 91 s late."""
+    delays = []
+    for seed in range(40, 46):
+        r, t = run(SimConfig(seed=seed, n_buses=10, breakdown_prob=1.0))
+        for i in t.incidents.values():
+            if i.type == "BREAKDOWN_SUSPECTED":
+                delays.append(i.opened_ts - r.breakdowns[i.bus_id][0])
+        assert len([i for i in t.incidents.values() if i.type == "BREAKDOWN_SUSPECTED"]) == len(r.breakdowns)
+    assert min(delays) >= 100 and max(delays) <= 160
+    assert sorted(delays)[len(delays) // 2] >= 145          # typical case: about the window length
+
+
+def test_no_false_breakdowns_in_heavy_traffic_or_long_dwells():
+    cfg = SimConfig(seed=31, n_buses=30, traffic_prob=0.6, dwell_s=(30.0, 45.0))
+    r, t = run(cfg)
+    assert not [i for i in t.incidents.values() if i.type == "BREAKDOWN_SUSPECTED"]
+
+
+def test_breakdown_sends_delay_update_then_fresh_alert():
+    r, t = run(SimConfig(seed=32, n_buses=8, breakdown_prob=1.0))
+    by_stop = {}
+    for n in t.notifications:
+        by_stop.setdefault((n.trip_id, n.stop_id), []).append(n.kind)
+    delayed = [k for k, kinds in by_stop.items() if "DELAY_UPDATE" in kinds]
+    assert delayed, "some stops were alerted before the breakdown"
+    for k in delayed:
+        assert by_stop[k] == ["BUS_APPROACHING", "DELAY_UPDATE", "APPROACHING_AFTER_DELAY"]
+    # No stop ever gets more than one message of each kind.
+    for kinds in by_stop.values():
+        assert len(kinds) == len(set(kinds))
+
+
+def test_breakdown_state_survives_restore():
+    r = simulate(SimConfig(seed=33, n_buses=4, breakdown_prob=1.0))
+    a = Tracker(r.routes, r.frame, r.bus_route)
+    bus, (start, _end) = next(iter(r.breakdowns.items()))
+    cut = next(i for i, p in enumerate(r.pings) if p.ts > start + 200)
+    for p in r.pings[:cut]:
+        a.ingest(p)
+    assert bus in a._open_breakdown
+    b = Tracker(r.routes, r.frame, r.bus_route)
+    b.restore([a.export_bus(x) for x in a.buses],
+              [i for i in a.incidents.values() if i.closed_ts is None])
+    for p in r.pings[cut:]:
+        a.ingest(p)
+        b.ingest(p)
+    ka = [(n.kind, n.stop_id) for n in a.notifications[-40:] if n.sent_ts > r.pings[cut].ts]
+    kb = [(n.kind, n.stop_id) for n in b.notifications]
+    assert ka == kb
 
 
 # ----------------------------------------------------------------- ETA modes
@@ -217,3 +284,16 @@ def test_export_restore_roundtrip():
 def test_validation_rejects_bad_coordinates():
     with pytest.raises(Exception):
         GpsPing(event_id="e", bus_id="b", trip_id="t", seq=0, ts=0, lat=95, lon=0, speed_mps=0, heading=0)
+
+
+def test_no_eta_shown_while_broken_down():
+    r = simulate(SimConfig(seed=34, n_buses=3, breakdown_prob=1.0))
+    t = Tracker(r.routes, r.frame, r.bus_route)
+    seen_open = False
+    for p in r.pings:
+        t.ingest(p)
+        for b in t.snapshot():
+            if b["breakdown"]:
+                seen_open = True
+                assert b["next_stop_eta_ts"] is None and t.etas(b["bus_id"]) == {}
+    assert seen_open

@@ -50,7 +50,8 @@ def reference(pings, sim):
     for p in pings:
         t.ingest(p)
         t.check_stale(p.ts)
-    return {(n.trip_id, n.stop_id) for n in t.notifications}, {i.incident_id for i in t.incidents.values()}
+    return ({(n.trip_id, n.stop_id, n.kind) for n in t.notifications},
+            {i.incident_id for i in t.incidents.values()})
 
 
 def drain(pipe, **kw):
@@ -65,7 +66,8 @@ def drain(pipe, **kw):
 
 
 def db_alerts(conn):
-    return {(r["trip_id"], r["stop_id"]) for r in conn.execute("SELECT trip_id, stop_id FROM notifications")}
+    return {(r["trip_id"], r["stop_id"], r["kind"])
+            for r in conn.execute("SELECT trip_id, stop_id, kind FROM notifications")}
 
 
 # ----------------------------------------------------------------- schema

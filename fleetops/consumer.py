@@ -12,7 +12,7 @@ For every batch:
 
 A crash between 3 and 4 means Kafka redelivers the batch. On restart the
 tracker is rebuilt from bus_state, whose last_seq already covers those pings,
-so they are dropped and no alert is sent twice. The UNIQUE(trip_id, stop_id)
+so they are dropped and no alert is sent twice. The UNIQUE(trip_id, stop_id, kind)
 constraint on alerts is a second guard; `alerts_rejected_by_db` counts how
 often it had to act (target: 0).
 

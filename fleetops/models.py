@@ -41,17 +41,24 @@ class Route(BaseModel):
     stops: list[Stop]
 
 
+class NotificationKind(str, Enum):
+    BUS_APPROACHING = "BUS_APPROACHING"
+    DELAY_UPDATE = "DELAY_UPDATE"                       # "your bus is delayed" after an approaching alert
+    APPROACHING_AFTER_DELAY = "APPROACHING_AFTER_DELAY"  # fresh alert once the bus moves again
+
+
 class Notification(BaseModel):
-    kind: str = "BUS_APPROACHING"
+    kind: str = NotificationKind.BUS_APPROACHING.value
     bus_id: str
     trip_id: str
     stop_id: str
     sent_ts: float
-    predicted_arrival_ts: float
+    predicted_arrival_ts: float | None    # None for DELAY_UPDATE (no meaningful ETA)
 
 
 class IncidentType(str, Enum):
     GPS_LOST = "GPS_LOST"
+    BREAKDOWN_SUSPECTED = "BREAKDOWN_SUSPECTED"
 
 
 class Incident(BaseModel):

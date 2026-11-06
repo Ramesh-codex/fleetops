@@ -115,11 +115,12 @@ def bench_crash(args, restore: bool):
         return Pipeline.from_db(broker.consumer(group, topic), broker.producer(), conn, restore=restore)
 
     m = consume(make_pipe(), len(pings), batch=100, crash_every=4, make_pipe=make_pipe)
-    rows = [(r["trip_id"], r["stop_id"]) for r in conn.execute("SELECT trip_id, stop_id FROM notifications")]
+    rows = [(r["trip_id"], r["stop_id"], r["kind"])
+            for r in conn.execute("SELECT trip_id, stop_id, kind FROM notifications")]
     ref = Tracker(sim.routes, sim.frame, sim.bus_route)
     for p in pings:
         ref.ingest(p)
-    want = {(n.trip_id, n.stop_id) for n in ref.notifications}
+    want = {(n.trip_id, n.stop_id, n.kind) for n in ref.notifications}
     conn.close()
     return {"crashes": m["crashes"], "rejected": m["rejected"], "stored": len(rows),
             "dup_stored": len(rows) - len(set(rows)), "missing": len(want - set(rows)),
@@ -167,7 +168,7 @@ def main():
         f"{with_r['missing']} / {with_r['expected']} | {with_r['extra']} |",
         f"| start with an empty tracker | {without['crashes']} | {without['dup_stored']} | {without['rejected']} | "
         f"{without['missing']} / {without['expected']} | {without['extra']} |", "",
-        "'Blocked by DB' = the tracker tried to alert again and only the UNIQUE(trip_id, stop_id) "
+        "'Blocked by DB' = the tracker tried to alert again and only the UNIQUE(trip_id, stop_id, kind) "
         "constraint stopped it. 'Missing'/'extra' compare against one uninterrupted run.", "",
     ]
     report = "\n".join(lines)
