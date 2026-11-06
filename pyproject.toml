@@ -10,7 +10,7 @@ fleetops = ["migrations/*.sql", "static/*.html", "static/vendor/leaflet/*", "sta
 
 [project]
 name = "fleetops"
-version = "0.2.0"
+version = "0.3.0"
 description = "Real-time school bus tracking and parent ETA pipeline (portfolio project, synthetic data only)"
 requires-python = ">=3.11"
 dependencies = [
@@ -20,6 +20,7 @@ dependencies = [
   "prometheus-client>=0.20",
   "psycopg[binary]>=3.2",
   "kafka-python>=2.1",
+  "anthropic>=0.40",
 ]
 
 [project.optional-dependencies]

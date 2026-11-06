@@ -23,6 +23,16 @@
   .row { display:flex; justify-content:space-between; gap:8px; padding:6px 0; border-bottom:1px solid var(--line); font-size:13px; }
   .row > span:last-child { color:var(--muted); font-variant-numeric: tabular-nums; text-align:right; }
   .pill { font-size:11px; padding:1px 6px; border-radius:99px; color:#fff; }
+  .plan { border:1px solid var(--line); border-radius:8px; padding:10px; margin-bottom:8px; font-size:13px; }
+  .plan .meta { color:var(--muted); font-size:12px; margin:4px 0; }
+  .plan ul { margin:4px 0 0 16px; padding:0; color:var(--muted); font-size:12px; }
+  .plan .risk { color:var(--warn); }
+  .plan button { font:inherit; font-size:12px; padding:4px 10px; border-radius:6px; border:1px solid var(--line);
+                 background:var(--panel); cursor:pointer; margin-right:6px; margin-top:6px; }
+  .plan button.go { background:var(--ok); color:#fff; border-color:var(--ok); }
+  .plan details { margin-top:6px; } .plan summary { cursor:pointer; color:var(--accent); font-size:12px; }
+  .actas { display:flex; gap:8px; align-items:center; margin-top:8px; font-size:12px; color:var(--muted); }
+  .actas select { font:inherit; font-size:12px; }
   .ok{background:var(--ok)} .warn{background:var(--warn)} .bad{background:var(--bad)} .done{background:var(--muted)}
   @media (max-width: 800px) { body { grid-template-columns: 1fr; grid-template-rows: 55vh auto; height:auto; }
     #map { height:55vh; } aside { border-left:0; border-top:1px solid var(--line); } }
@@ -43,6 +53,11 @@
   </div>
   <h2>Buses</h2><div id="buses"></div>
   <h2>Parent alerts</h2><div id="alerts"></div>
+  <div id="recovery" hidden>
+    <h2>Recovery plans</h2>
+    <div class="actas">Act as <select id="role"></select></div>
+    <div id="plans" style="margin-top:8px"></div>
+  </div>
   <h2>Incidents</h2><div id="incidents"></div>
 </aside>
 <script>
@@ -85,6 +100,7 @@ async function tick() {
     const [health, b, alerts, incs, stats] = await Promise.all(
       [j('/health'), j('/buses'), j('/notifications?limit=12'), j('/incidents'), j('/stats')]);
     await drawRoutes(health.run);
+    await initRecovery(health.mode);
     document.getElementById('clock').textContent = `sim ${fmt(b.sim_now)} · ${health.mode === 'db' ? 'Kafka pipeline' : 'run ' + health.run}`;
     const c = stats.counters, v = k => (c[k] ?? '–');
     document.getElementById('s-active').textContent = b.buses.filter(x => !x.finished).length;
@@ -118,7 +134,8 @@ async function tick() {
                <span>${x.next_stop ? esc(x.next_stop) + ' · ' + eta : ''}</span></div>`;
     }
     document.getElementById('buses').innerHTML = html;
-    const kindLabel = { DELAY_UPDATE: ['bad', 'delayed'], APPROACHING_AFTER_DELAY: ['warn', 'back on way'] };
+    const kindLabel = { DELAY_UPDATE: ['bad', 'delayed'], APPROACHING_AFTER_DELAY: ['warn', 'back on way'],
+                        REPLACEMENT_DISPATCHED: ['ok', 'replacement sent'] };
     document.getElementById('alerts').innerHTML = alerts.map(n => {
       const k = kindLabel[n.kind];
       const pill = k ? ` <span class="pill ${k[0]}">${k[1]}</span>` : '';
@@ -129,7 +146,65 @@ async function tick() {
        <span>${fmt(i.opened_ts)}</span></div>`).join('') || '<div class="sub">none</div>';
   } catch (e) { console.error(e); }
 }
+// ------------------------------------------------------------ recovery plans
+let tokens = null, role = null;
+try { role = localStorage.getItem('fleetops-role'); } catch (e) {}
+async function initRecovery(mode) {
+  if (mode !== 'db' || tokens !== null) return;
+  const r = await fetch('/auth/dev-tokens');
+  tokens = r.ok ? await r.json() : {};
+  if (!Object.keys(tokens).length) return;
+  const sel = document.getElementById('role');
+  sel.innerHTML = ['viewer', 'dispatcher', 'admin'].filter(k => tokens[k])
+    .map(k => `<option value="${k}">${k}</option>`).join('');
+  if (!role || !tokens[role]) role = tokens.dispatcher ? 'dispatcher' : Object.keys(tokens)[0];
+  sel.value = role;
+  sel.onchange = () => { role = sel.value; try { localStorage.setItem('fleetops-role', role); } catch (e) {} refreshPlans(); };
+  document.getElementById('recovery').hidden = false;
+}
+function auth() { return { Authorization: 'Bearer ' + (tokens?.[role] || '') }; }
+const planPill = { pending_approval: ['warn', 'awaiting approval'], approved: ['ok', 'approved'],
+  rejected: ['done', 'rejected'], no_feasible_plan: ['bad', 'no feasible plan'], superseded: ['done', 'superseded'] };
+async function act(url, body) {
+  const r = await fetch(url, { method: 'POST', headers: { ...auth(), 'Content-Type': 'application/json' },
+                               body: JSON.stringify(body || {}) });
+  if (!r.ok) {
+    const e = await r.json().catch(() => ({}));
+    const d = e.detail || {};
+    alert((d.error || d || r.statusText) + (d.failures ? '\n' + d.failures.join('\n') : ''));
+  }
+  refreshPlans();
+}
+async function refreshPlans() {
+  if (!tokens || !Object.keys(tokens).length) return;
+  const r = await fetch('/plans?limit=8', { headers: auth() });
+  if (!r.ok) return;
+  const plans = await r.json();
+  const canDecide = role === 'dispatcher' || role === 'admin';
+  document.getElementById('plans').innerHTML = plans.map(p => {
+    const [cls, label] = planPill[p.status] || ['done', p.status];
+    const checks = (p.checks || []).map(c => `<li>${c.ok ? '✓' : '✗'} ${esc(c.name)}: ${esc(c.detail)}</li>`).join('');
+    const tools = (p.evidence || []).map(e => `<li>${esc(e.tool)}</li>`).join('');
+    const risks = (p.risks || []).map(r => `<li class="risk">${esc(r)}</li>`).join('');
+    const buttons = p.status === 'pending_approval' && canDecide
+      ? `<button class="go" onclick="act('/plans/${esc(p.plan_id)}/approve')">Approve</button>
+         <button onclick="act('/plans/${esc(p.plan_id)}/reject', {note: prompt('Reason for rejecting?') || ''})">Reject</button>`
+      : (p.status === 'rejected' && canDecide
+        ? `<button onclick="act('/incidents/${esc(p.incident_id)}/replan')">Ask for another plan</button>` : '');
+    return `<div class="plan"><span class="pill ${cls}">${label}</span>
+      <span class="sub"> ${esc(p.planner)} planner · attempt ${p.attempt}</span>
+      <div style="margin-top:6px">${esc(p.summary)}</div>
+      ${p.rationale ? `<div class="meta">Why: ${esc(p.rationale)}</div>` : ''}
+      ${p.llm_error ? `<div class="meta">LLM fell back to rules: ${esc(p.llm_error)}</div>` : ''}
+      ${risks ? `<ul>${risks}</ul>` : ''}
+      <details><summary>Evidence and checks</summary><ul>${checks}</ul><ul>${tools}</ul></details>
+      ${p.decided_by ? `<div class="meta">Decided by ${esc(p.decided_by)}${p.decision_note ? ': ' + esc(p.decision_note) : ''}</div>` : ''}
+      ${buttons}</div>`;
+  }).join('') || '<div class="sub">none yet — plans appear when a bus breaks down</div>';
+}
+
 tick(); setInterval(tick, 1000);
+setInterval(refreshPlans, 3000);
 </script>
 </body>
 </html>

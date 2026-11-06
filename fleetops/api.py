@@ -19,9 +19,10 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 
 from .geo import LocalFrame
@@ -215,6 +216,112 @@ def post_ping(p: GpsPing):
     if MODE == "db":
         raise HTTPException(405, "db mode: publish pings to Kafka instead")
     return {"outcome": rt.ingest(p)}
+
+
+# ----------------------------------------------------------- recovery (db mode)
+def _tokens() -> dict[str, tuple[str, str]]:
+    """token -> (actor, role). FLEETOPS_TOKENS="role:token,..." overrides the
+    dev tokens, which exist only when FLEETOPS_DEV_AUTH is not 0."""
+    raw = os.getenv("FLEETOPS_TOKENS")
+    if not raw and os.getenv("FLEETOPS_DEV_AUTH", "1") != "0":
+        raw = "admin:dev-admin,dispatcher:dev-dispatcher,viewer:dev-viewer"
+    out = {}
+    for part in (raw or "").split(","):
+        if ":" in part:
+            role, tok = part.split(":", 1)
+            out[tok.strip()] = (f"{role.strip()}-user", role.strip())
+    return out
+
+
+def _who(authorization: str | None) -> tuple[str, str]:
+    tok = (authorization or "").removeprefix("Bearer ").strip()
+    who = _tokens().get(tok)
+    if who is None:
+        raise HTTPException(401, "missing or invalid token")
+    return who
+
+
+def _db_only():
+    if MODE != "db":
+        raise HTTPException(501, "recovery runs in db mode (docker compose)")
+
+
+@app.get("/auth/dev-tokens")
+def dev_tokens():
+    """Demo convenience for the map's 'act as' selector. Disabled with FLEETOPS_DEV_AUTH=0."""
+    if os.getenv("FLEETOPS_DEV_AUTH", "1") == "0" or os.getenv("FLEETOPS_TOKENS"):
+        raise HTTPException(404)
+    return {role: tok for tok, (_actor, role) in _tokens().items()}
+
+
+@app.get("/plans")
+def plans(limit: int = Query(20, ge=1, le=200), authorization: str | None = Header(None)):
+    _db_only()
+    _who(authorization)
+    from .recovery import service
+    return service.list_plans(pg, limit)
+
+
+@app.get("/plans/{plan_id}")
+def plan(plan_id: str, authorization: str | None = Header(None)):
+    _db_only()
+    _who(authorization)
+    from .recovery import service
+    p = service.get_plan(pg, plan_id)
+    if p is None:
+        raise HTTPException(404, "unknown plan")
+    return p
+
+
+class Decision(BaseModel):
+    note: str = Field("", max_length=500)
+
+
+def _decide(fn, *args):
+    from .recovery import service
+    try:
+        return fn(pg, *args)
+    except service.Forbidden as e:
+        raise HTTPException(403, str(e))
+    except service.Conflict as e:
+        raise HTTPException(409, {"error": str(e), **e.detail})
+    except KeyError:
+        raise HTTPException(404, "not found")
+
+
+@app.post("/plans/{plan_id}/approve")
+def approve_plan(plan_id: str, authorization: str | None = Header(None)):
+    _db_only()
+    actor, role = _who(authorization)
+    from .recovery import service
+    return _decide(service.approve, plan_id, actor, role)
+
+
+@app.post("/plans/{plan_id}/reject")
+def reject_plan(plan_id: str, body: Decision = Decision(), authorization: str | None = Header(None)):
+    _db_only()
+    actor, role = _who(authorization)
+    from .recovery import service
+    return _decide(service.reject, plan_id, actor, role, body.note)
+
+
+@app.post("/incidents/{incident_id}/replan")
+def replan_incident(incident_id: str, authorization: str | None = Header(None)):
+    _db_only()
+    actor, role = _who(authorization)
+    from .recovery import service
+    from .recovery.worker import make_planner
+    return _decide(service.replan, incident_id, make_planner(), actor, role)
+
+
+@app.get("/audit")
+def audit(limit: int = Query(100, ge=1, le=1000), authorization: str | None = Header(None)):
+    _db_only()
+    _actor, role = _who(authorization)
+    if role not in ("admin", "dispatcher"):
+        raise HTTPException(403, "audit log is for dispatchers and admins")
+    from .recovery import service
+    return service.audit_log(pg, limit)
 
 
 @app.get("/metrics")

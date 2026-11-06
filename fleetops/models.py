@@ -45,6 +45,7 @@ class NotificationKind(str, Enum):
     BUS_APPROACHING = "BUS_APPROACHING"
     DELAY_UPDATE = "DELAY_UPDATE"                       # "your bus is delayed" after an approaching alert
     APPROACHING_AFTER_DELAY = "APPROACHING_AFTER_DELAY"  # fresh alert once the bus moves again
+    REPLACEMENT_DISPATCHED = "REPLACEMENT_DISPATCHED"    # dispatcher approved a replacement bus
 
 
 class Notification(BaseModel):

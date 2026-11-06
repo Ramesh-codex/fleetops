@@ -6,9 +6,9 @@ GPS-loss incidents for dispatchers.
 
 > Independent project. Synthetic data only — no real routes, students, or company systems.
 
-**Status: v0.3 (part 1)** — breakdown detection and parent delay updates, on top of v0.2
-(Kafka, PostgreSQL/PostGIS, crash-safe consumer, dead letters, Prometheus + Grafana).
-Next: an AI recovery agent that proposes a replacement bus for dispatcher approval.
+**Status: v0.3** — breakdown detection, parent delay updates, and an AI recovery agent that
+proposes a replacement bus for a dispatcher to approve; on top of v0.2 (Kafka,
+PostgreSQL/PostGIS, crash-safe consumer, dead letters, Prometheus + Grafana).
 Nothing below is claimed unless it runs.
 
 ![Live map](docs/screenshot.png)
@@ -22,6 +22,12 @@ producer ──▶ Kafka: gps.pings.v1 ──▶ consumer ───────�
  poison msgs) stay in order         └─ good ─▶ tracker            ONE transaction / batch,
                                                                   THEN Kafka offset commit
         consumer + API ──/metrics──▶ Prometheus ──▶ Grafana ("FleetOps pipeline" dashboard)
+
+open BREAKDOWN incident ──▶ recovery worker ──▶ planner: Claude + read-only tools
+                                               (rule planner if no key / timeout / bad output)
+                                          ──▶ deterministic validator ──▶ plan: pending approval
+dispatcher (map UI or API, role-checked) ──▶ approve: re-validate under row locks ──▶ assign spare,
+                                             notify parents, audit log
 ```
 
 `FLEETOPS_MODE=demo` (default) still runs the whole thing in one process with no Kafka or
@@ -53,8 +59,53 @@ database, which is what `uvicorn fleetops.api:app` gives you.
   ordering, redelivery of uncommitted messages) so crash behaviour is unit-testable.
 - **Database** (`fleetops/db.py`, `fleetops/migrations/`) — PostGIS geometry for routes,
   stops and bus positions; `UNIQUE(trip_id, stop_id)` on alerts as a second guard.
+- **Recovery** (`fleetops/recovery/`) — see "AI recovery agent" below.
 - **API + map** (`fleetops/api.py`) — demo mode replays the simulator in-process;
   db mode serves what the consumer wrote, plus `GET /stops/near` (PostGIS `ST_DWithin`).
+
+## AI recovery agent
+
+When a breakdown opens, the recovery worker builds a plan:
+
+1. **Investigate with read-only tools** over a snapshot of the fleet: `get_incident_details`,
+   `get_vehicle_status`, `get_route_details`, `find_available_buses`, `find_available_drivers`,
+   `calculate_replacement_route`, `estimate_recovery_eta`, `validate_recovery_plan`, then
+   `submit_plan_for_approval`. No tool can change anything; unknown ids return an error, not a guess.
+2. **The model only chooses ids.** ETA, seats and riders in the stored plan are computed by the
+   system. In the eval, the model claimed "2 minutes"; the plan stores the system's own number.
+3. **Deterministic validator**: incident still open, spare exists and is free, enough seats for
+   the route's riders, driver available at the same depot, ETA under 30 min. A failing proposal
+   goes back to the model once as an error `tool_result`; after that the rule planner takes over.
+4. **Rule planner fallback** (nearest feasible spare, smallest bus that fits) when there is no
+   API key, the call times out, or the model can't produce a valid plan. The plan records which
+   planner made it and why the LLM was bypassed.
+5. **Dispatcher decides.** Nothing changes and no parent is told anything until approval.
+   Approval re-runs the validator inside a transaction that locks the spare and driver rows,
+   then assigns them, notifies parents on the remaining stops, and writes the audit log.
+   Viewers can read plans but not decide; every denied attempt is audited.
+
+Claude (`claude-haiku-5-5` by default) is used when `ANTHROPIC_API_KEY` is set; otherwise the rule
+planner runs, so the demo and CI cost nothing. In CI and tests the model is replaced by a scripted
+client with the same response shape as the Anthropic SDK. The Claude path has also been run live
+against the full Docker stack: it planned real breakdowns, flagged tight capacity and an
+unconfirmed breakdown as risks on its own, and every plan passed the validator.
+
+| eval case (spec) | result | test |
+|---|---|---|
+| No replacement bus available | `no_feasible_plan`, reason stated | `test_case_no_replacement_bus_available` |
+| Insufficient vehicle capacity | `no_feasible_plan`, "no available spare seats 90 riders" | `test_case_insufficient_capacity` |
+| Driver unavailable | `no_feasible_plan`, "no available driver at …" | `test_case_driver_unavailable` |
+| Stale GPS information | plan flagged with a stale-GPS risk | `test_case_stale_gps_is_flagged_as_risk` |
+| Contradictory tool results (model says nothing fits, tools disagree) | model challenged; rule plan used | `test_case_llm_wrongly_says_nothing_is_feasible` |
+| LLM timeout | rule planner, `llm_error` recorded | `test_case_llm_timeout_falls_back_to_rules` |
+| Model invents a bus id | validator rejects twice; rule planner used | `test_case_llm_invents_a_bus_falls_back_to_rules` |
+| Model corrects itself after validator feedback | second proposal accepted | `test_case_llm_corrects_itself_after_validator_feedback` |
+| Duplicate incident events | exactly one plan | `test_case_duplicate_incident_event_creates_one_plan` |
+| Approval rejected | rejected, audited; re-plan excludes that bus | `test_case_approval_rejected_then_replan_excludes_that_bus` |
+| Unauthorized action attempt | 403, nothing changed, `approve_denied` audited | `test_case_unauthorized_action_attempt`, `test_api_roles_and_decisions` |
+| Two plans, one spare | second approval blocked under lock, recorded | `test_two_plans_cannot_assign_the_same_spare` |
+| Breakdown ends before a decision | approval blocked; plan superseded | `test_approval_blocked_after_breakdown_ends` |
+| Model leaks markup into its text fields (seen live) | clean rationale, risks recovered | `test_case_llm_leaks_markup_into_rationale` |
 
 ## Engineering findings
 
@@ -151,6 +202,37 @@ comparing incidents against the simulator's ground truth.
   end a breakdown). Across 6 seeds and 60 breakdowns: exactly one incident each, detected
   146–152 s after the stop in the typical case, 0 false positives.
 
+### v0.3 (recovery agent)
+
+**13. Every concurrent breakdown was offered the same spare and driver.** Seen in the first demo
+data: three plans, all "send SP-201 with DRV-11". Pending plans reserved nothing, so the
+approval lock would have refused every approval after the first. Fix: spares and drivers named in
+another incident's pending plan are soft-reserved for planning. Regression test plans three
+simultaneous breakdowns and approves all of them.
+
+**14. The fix for 13 created a deadlock.** Applying soft reservations at *approval* time meant two
+pending plans naming the same spare each blocked the other, so neither could ever be approved.
+Caught by the test that forces that clash. Reservations now guide planning only; at approval the
+row lock and real assignment status decide, and the first approval wins.
+
+**15. Every plan said "stale GPS".** Seen on the map: buses reporting normally were flagged
+139–266 s stale. The recovery code measured GPS age against the newest timestamp across all
+buses, and during a backlog some Kafka partitions run minutes ahead: the same mistake as
+finding 5, made again in a new module. Fix: use the consumer's own partition-aware judgement
+(`bus_state.gps_lost`) instead of recomputing it.
+
+**16. A blocked approval would have erased its own audit record.** Raising the "plan no longer
+valid" error inside the transaction rolled back the audit row and the status change with it.
+Caught in review before the tests ran; the race test now asserts the `approve_blocked` row exists.
+
+**17. A real model put its risk list inside the rationale.** Only visible in the live run with
+Claude: one plan's "Why" ended in raw markup (`</rationale> <parameter name="risks">[...]`) and its
+risk list was empty. The ids and numbers were fine, since the validator checks those, but the
+dispatcher saw junk text and lost the model's warnings. Fix: the submit tool is now `strict`, and
+the free-text fields are cleaned before storing: the leaked part is split off, the risk list is
+recovered when it parses, stray tags are removed. The scripted-client tests could never have
+produced this; it took a real model.
+
 **Known limit:** after a breakdown, stops just past where the bus stopped get their fresh
 alert late (10% of scored stops in the breakdown scenario; 92 of the 93 late alerts are
 these). The earliest anyone can know the bus is coming again is when it moves, and a stop
@@ -229,7 +311,19 @@ FLEETOPS_TEST_KAFKA=localhost:9094 pytest
 python bench/pipeline_bench.py --out bench/PIPELINE_RESULTS.md
 ```
 
-Environment variables: `FLEETOPS_MODE` (demo | db), `FLEETOPS_KAFKA`, `FLEETOPS_DB`,
+Recovery agent with Claude instead of the rule planner (optional, uses your API credits):
+
+```powershell
+$env:ANTHROPIC_API_KEY = "sk-ant-..."     # Linux/macOS: export ANTHROPIC_API_KEY=...
+docker compose up -d recovery
+```
+
+On the map, "Act as" switches between viewer, dispatcher and admin using demo tokens
+(`dev-viewer`, `dev-dispatcher`, `dev-admin`). Set `FLEETOPS_DEV_AUTH=0` and
+`FLEETOPS_TOKENS="dispatcher:<secret>,..."` to turn the demo tokens off.
+
+Environment variables: `FLEETOPS_MODE` (demo | db), `FLEETOPS_PLANNER` (auto | rules | llm),
+`FLEETOPS_LLM_MODEL`, `FLEETOPS_KAFKA`, `FLEETOPS_DB`,
 `FLEETOPS_SEED` (42), `FLEETOPS_BUSES` (12), `FLEETOPS_SPEEDUP` (10 = 10× real time),
 `FLEETOPS_FAULTS` (1), `FLEETOPS_POISON` (0.001 = share of malformed messages).
 
@@ -245,6 +339,10 @@ Environment variables: `FLEETOPS_MODE` (demo | db), `FLEETOPS_KAFKA`, `FLEETOPS_
 | GET | `/stats` | Demo: ingestion counters. DB: stored alerts / incidents / dead letters |
 | GET | `/stops/near?lat=&lon=&radius_m=` | Stops near a point, nearest first (PostGIS in db mode) |
 | POST | `/pings` | Demo mode only: ingest one ping (validated; idempotent) |
+| GET | `/plans`, `/plans/{id}` | Recovery plans (any role) |
+| POST | `/plans/{id}/approve`, `/plans/{id}/reject` | Dispatcher or admin |
+| POST | `/incidents/{id}/replan` | New plan after a rejection (dispatcher or admin) |
+| GET | `/audit` | Audit log (dispatcher or admin) |
 | GET | `/metrics` | Prometheus metrics |
 | GET | `/docs` | OpenAPI docs |
 
@@ -268,8 +366,7 @@ Environment variables: `FLEETOPS_MODE` (demo | db), `FLEETOPS_KAFKA`, `FLEETOPS_
 
 - **v0.2.x** — measure end-to-end latency and lag recovery under a broker restart; run two
   consumers in one group and verify partition rebalancing.
-- **v0.3 part 2** — AI recovery agent: on a breakdown it proposes a spare bus using real tools
-  (no invented buses), a deterministic validator checks capacity and ETA, and a dispatcher
-  approves or rejects it. A rule-based planner is used when the LLM is unavailable.
+- **v0.3.x** — measure LLM vs rule planner on a fixed set of breakdowns (agreement, latency,
+  cost); route-level ETA for the replacement instead of straight-line × road factor.
 - **v0.4** — electric bus charging scheduler (depot charger limits, tariff windows,
   state-of-charge constraints; greedy vs OR-Tools).

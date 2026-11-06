@@ -29,6 +29,9 @@ def ensure_seeded(conn) -> None:
     from .producer import sim_config_from_env
     from .simulator import simulate
     db.migrate(conn)
+    cfg = sim_config_from_env()
     if not db.load_routes(conn)[0]:
-        sim = simulate(sim_config_from_env())
+        sim = simulate(cfg)
         db.seed_routes(conn, sim.routes, sim.bus_route)
+    from .recovery.service import seed_fleet
+    seed_fleet(conn, cfg.seed)

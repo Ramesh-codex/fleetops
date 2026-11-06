@@ -34,7 +34,7 @@ jobs:
         env:
           FLEETOPS_TEST_DB: postgresql://postgres:postgres@localhost:5432/fleetops_test
           FLEETOPS_TEST_KAFKA: localhost:9094
-        run: pytest -q tests/test_pipeline.py tests/test_kafka_integration.py -rs
+        run: pytest -q tests/test_pipeline.py tests/test_kafka_integration.py tests/test_recovery.py -rs
       - name: Pipeline benchmark (real Kafka)
         run: |
           python bench/pipeline_bench.py --kafka localhost:9094 \
@@ -53,7 +53,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: docker compose config -q
-      - run: docker compose up -d --build --wait kafka postgres consumer api prometheus grafana
+      - run: docker compose up -d --build --wait kafka postgres consumer recovery api prometheus grafana
       - run: docker compose up -d producer
       - name: Alerts, incidents and dead letters reach the API
         run: |
@@ -66,6 +66,25 @@ jobs:
             sleep 3
           done
           curl -sf localhost:8000/stats | python3 -c "import sys,json; c=json.load(sys.stdin)['counters']; assert c['notifications']>20 and c['dead_letters']>0, c"
+      - name: A breakdown gets a recovery plan, and a dispatcher can decide it
+        run: |
+          H="Authorization: Bearer dev-dispatcher"
+          for i in $(seq 1 80); do
+            n=$(curl -sf -H "$H" localhost:8000/plans | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" || echo 0)
+            [ "$n" -gt 0 ] && break
+            sleep 3
+          done
+          curl -sf -H "$H" localhost:8000/plans | python3 -c "
+          import sys, json
+          plans = json.load(sys.stdin)
+          assert plans, 'no recovery plan was created'
+          for p in plans: print(p['status'], p['planner'], p['summary'])
+          "
+          # A viewer may not decide; that attempt must be refused and audited.
+          id=$(curl -sf -H "$H" localhost:8000/plans | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['plan_id'])")
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer dev-viewer" localhost:8000/plans/$id/approve)
+          [ "$code" = "403" ]
+          curl -sf -H "Authorization: Bearer dev-admin" localhost:8000/audit | grep -q approve_denied
       - name: Prometheus scrapes the consumer
         run: |
           for i in $(seq 1 20); do
@@ -81,4 +100,4 @@ jobs:
           done
           exit 1
       - if: always()
-        run: docker compose logs consumer producer api | tail -80
+        run: docker compose logs consumer producer recovery api | tail -120

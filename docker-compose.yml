@@ -80,6 +80,20 @@ services:
     depends_on:
       kafka: { condition: service_healthy }
 
+  # Plans every breakdown (Claude when ANTHROPIC_API_KEY is set, rules otherwise).
+  # Separate from the consumer so a slow LLM call never holds up GPS ingestion.
+  recovery:
+    <<: *app
+    command: ["python", "-m", "fleetops.recovery.worker"]
+    environment:
+      <<: *app-env
+      FLEETOPS_PLANNER: "${FLEETOPS_PLANNER:-auto}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      FLEETOPS_LLM_MODEL: "${FLEETOPS_LLM_MODEL:-claude-haiku-5-5}"
+      FLEETOPS_HEALTH_URL: http://localhost:9109/metrics
+    depends_on:
+      postgres: { condition: service_healthy }
+
   api:
     <<: *app
     environment:
