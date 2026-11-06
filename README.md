@@ -151,6 +151,10 @@ Target lead is 300 s. Only stops more than 6 minutes from the trip start are sco
 
 ### Pipeline benchmark (Kafka → consumer → Postgres)
 
+![Grafana dashboard](docs/grafana.png)
+
+*Live run on Docker Desktop. 16:20-16:26: a restarted producer replays the morning and the consumer rejects all of it as already applied (orange; finding 10). From 16:26: the fixed producer's new trips are accepted and alerts resume. Alerts blocked by the DB stay at 0 throughout.*
+
 `python bench/pipeline_bench.py` against `docker compose up -d kafka postgres`. CI runs it
 on every push against real Kafka 3.9 and posts the report in the run summary.
 Numbers below are from a GitHub Actions runner: [`bench/PIPELINE_RESULTS.md`](bench/PIPELINE_RESULTS.md).
