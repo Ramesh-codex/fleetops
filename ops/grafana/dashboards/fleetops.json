@@ -33,7 +33,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (outcome) (rate(fleetops_consumer_messages_total[1m]))",
+          "expr": "sum by (outcome) (rate(fleetops_consumer_messages_total{job=\"consumer\"}[1m]))",
           "legendFormat": "{{outcome}}{{reason}}"
         }
       ]
@@ -62,12 +62,12 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(fleetops_e2e_latency_seconds_bucket[1m])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(fleetops_e2e_latency_seconds_bucket{job=\"consumer\"}[1m])))",
           "legendFormat": "p50"
         },
         {
           "refId": "B",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(fleetops_e2e_latency_seconds_bucket[1m])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(fleetops_e2e_latency_seconds_bucket{job=\"consumer\"}[1m])))",
           "legendFormat": "p99"
         }
       ]
@@ -96,8 +96,8 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "fleetops_consumer_lag_messages",
-          "legendFormat": "Consumer lag (messages)"
+          "expr": "fleetops_consumer_lag_messages{job=\"consumer\"}",
+          "legendFormat": "Consumer lag"
         }
       ]
     },
@@ -125,8 +125,8 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(fleetops_consumer_batch_seconds_bucket[1m])))",
-          "legendFormat": "{{outcome}}{{reason}}"
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(fleetops_consumer_batch_seconds_bucket{job=\"consumer\"}[1m])))",
+          "legendFormat": "p99"
         }
       ]
     },
@@ -154,7 +154,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "60 * rate(fleetops_consumer_alerts_total[1m])",
+          "expr": "60 * rate(fleetops_consumer_alerts_total{job=\"consumer\"}[1m])",
           "legendFormat": "Parent alerts / min"
         }
       ]
@@ -183,7 +183,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "60 * sum by (reason) (rate(fleetops_consumer_dead_letters_total[1m]))",
+          "expr": "60 * sum by (reason) (rate(fleetops_consumer_dead_letters_total{job=\"consumer\"}[1m]))",
           "legendFormat": "{{outcome}}{{reason}}"
         }
       ]
@@ -218,7 +218,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "fleetops_consumer_gps_lost_open",
+          "expr": "fleetops_consumer_gps_lost_open{job=\"consumer\"}",
           "legendFormat": "Buses in GPS_LOST"
         }
       ]
@@ -253,8 +253,8 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "fleetops_consumer_alerts_rejected_by_db_total",
-          "legendFormat": "Alerts blocked by DB constraint (should be 0)"
+          "expr": "fleetops_consumer_alerts_rejected_by_db_total{job=\"consumer\"}",
+          "legendFormat": "Alerts blocked by DB constraint"
         }
       ]
     }

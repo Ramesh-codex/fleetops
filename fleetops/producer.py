@@ -30,16 +30,38 @@ def sim_config_from_env() -> SimConfig:
     return cfg
 
 
-def day_pings(sim: SimResult, day: int) -> list[GpsPing]:
+def day_pings(sim: SimResult, day: int, *, start_ts: float | None = None, tag: str = "") -> list[GpsPing]:
+    """The seeded morning as 'day N', with fresh ids so the tracker sees new trips.
+
+    start_ts anchors the first ping at that event time; without it days are laid
+    end to end after the simulator's own start time (used by tests). `tag`
+    keeps ids unique across producer restarts.
+    """
     span = sim.end_ts - sim.pings[0].ts + 600
+    shift = (start_ts - sim.pings[0].ts) if start_ts is not None else day * span
     out = []
     for p in sim.pings:
         out.append(p.model_copy(update={
-            "event_id": f"D{day}-{p.event_id}",
-            "trip_id": f"D{day}-{p.trip_id}",
-            "ts": round(p.ts + day * span, 3),
+            "event_id": f"{tag}D{day}-{p.event_id}",
+            "trip_id": f"{tag}D{day}-{p.trip_id}",
+            "ts": round(p.ts + shift, 3),
         }))
     return out
+
+
+# Virtual clock origin. Simulated time runs `speedup` times faster than real
+# time from this fixed point, so it only ever moves forward — also across
+# producer restarts. Anchoring a restart at plain wall-clock 'now' would put it
+# behind pings already sent at 10x, and the consumer would (correctly) drop the
+# new trip as stale; restarting at day 0 replayed the past, which it also dropped.
+CLOCK_ORIGIN = 1_793_000_000.0      # 2026-10-26 UTC
+
+
+def virtual_now(speedup: float, wall: float | None = None) -> float:
+    wall = time.time() if wall is None else wall
+    if speedup <= 0:
+        return wall
+    return CLOCK_ORIGIN + (wall - CLOCK_ORIGIN) * speedup
 
 
 POISON = [
@@ -72,7 +94,7 @@ def publish(pings: list[GpsPing], producer: Producer, *, speedup: float = 0.0,
 
 def main() -> None:
     from .broker import KafkaBroker
-    from .consumer import wait_for
+    from .runtime import wait_for
 
     bootstrap = os.getenv("FLEETOPS_KAFKA", "localhost:9092")
     speedup = float(os.getenv("FLEETOPS_SPEEDUP", "10"))
@@ -80,11 +102,12 @@ def main() -> None:
     poison = float(os.getenv("FLEETOPS_POISON", "0.001"))
     producer = wait_for(lambda: KafkaBroker(bootstrap).producer(), "kafka")
     sim = simulate(sim_config_from_env())
+    tag = time.strftime("%y%m%d%H%M%S-", time.gmtime())   # unique per producer start
     day = 0
     while days == 0 or day < days:
-        n = publish(day_pings(sim, day), producer, speedup=speedup, poison_prob=poison,
-                    rng=random.Random(day))
-        print(f"day {day}: published {n} messages", flush=True)
+        pings = day_pings(sim, day, start_ts=virtual_now(speedup), tag=tag)
+        n = publish(pings, producer, speedup=speedup, poison_prob=poison, rng=random.Random(day))
+        print(f"{tag}day {day}: published {n} messages", flush=True)
         day += 1
 
 

@@ -107,6 +107,23 @@ called the API's `/health`, but the consumer and producer run from the same imag
 don't serve it, so Compose marked the consumer unhealthy and the stack never came up in CI.
 Fix: each service declares what "healthy" means for it (consumer: its metrics endpoint).
 
+**9. Every consumer panel in Grafana had a phantom zero series.** Seen on the live
+dashboard: consumer lag, alerts and GPS_LOST each showed two lines, one stuck at 0. The API
+imported two startup helpers from `consumer.py`; importing that module registered the
+consumer's Prometheus metrics in the API process too, and Prometheus scrapes both. Fix:
+helpers moved to `runtime.py`, dashboard queries scoped to `job="consumer"`, and a
+regression test that starts the API in db mode and checks its `/metrics`.
+
+**10. Restarting the producer rewound the world.** Also seen live: after `docker compose up
+--build`, accepted pings dropped to 0 and out-of-order rose to ~22/s. The restarted producer
+replayed "day 0" with the same ids and timestamps, and the consumer correctly rejected all of
+it as already applied (0 duplicate alerts). The consumer was right; the simulator was wrong.
+Plain wall-clock anchoring doesn't fix it either: at 10x, simulated time runs ahead of the
+wall clock, so a restart would land behind pings already sent and be dropped as stale. Fix:
+a virtual clock (`origin + (wall - origin) * speedup`) that only moves forward, plus a
+per-start id tag. Regression test restarts the producer mid-day and checks the new trips
+are accepted.
+
 **Known limit:** breakdowns still cause ~26% early alerts — the alert went out before the
 bus broke down, and no ETA model can foresee that. The fix belongs to the next layer:
 detect the breakdown and send parents a "delayed" update (v0.3, incident agent).

@@ -110,7 +110,7 @@ async def lifespan(_app: FastAPI):
     task = None
     if MODE == "db":
         from . import db
-        from .consumer import ensure_seeded, wait_for
+        from .runtime import ensure_seeded, wait_for
         pg = wait_for(lambda: db.connect(), "postgres")
         ensure_seeded(pg)
     else:
