@@ -49,7 +49,14 @@ class RulePlanner:
         big = [s for s in avail if s["capacity"] >= riders]
         if avail and not big:
             reasons.append(f"no available spare seats {riders} riders "
-                           f"(largest: {max(s['capacity'] for s in avail)})")
+                           f"(largest free: {max(s['capacity'] for s in avail)})")
+        # Say WHY bigger buses aren't free, or the dispatcher reads "largest: 24"
+        # as "the fleet only has small buses" (seen in the demo recording).
+        held = [s["bus_id"] for s in view.spares
+                if s["bus_id"] in view.reserved_spares and s["capacity"] >= riders]
+        if not big and held:
+            reasons.append(f"{', '.join(held)} would fit but "
+                           f"{'is' if len(held) == 1 else 'are'} held by other pending plans")
         for s in big:
             drv = next((d for d in view.drivers if view.driver_free(d) and d["depot_id"] == s["depot_id"]), None)
             if drv is None:

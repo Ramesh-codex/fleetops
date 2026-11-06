@@ -398,3 +398,15 @@ def test_submit_tool_is_strict():
     from fleetops.recovery.tools import TOOL_SPECS
     submit = next(t for t in TOOL_SPECS if t["name"] == "submit_plan_for_approval")
     assert submit["strict"] is True and submit["input_schema"]["additionalProperties"] is False
+
+
+def test_no_feasible_reason_names_spares_held_by_other_plans(conn, world):
+    """Regression from the demo recording: 'largest: 24' alone read as if the
+    fleet had no big buses, when the big ones were held by pending plans."""
+    open_now = _until_open_breakdowns(conn, world, 3)
+    conn.execute("UPDATE spare_buses SET status = 'out_of_service' WHERE bus_id IN ('SP-203', 'SP-205')")
+    first = service.create_plan(conn, open_now[0], RulePlanner())
+    assert first["spare_bus_id"] == "SP-201"
+    second = service.create_plan(conn, open_now[1], RulePlanner())
+    assert second["status"] == "no_feasible_plan"
+    assert "SP-201 would fit but is held by other pending plans" in second["summary"]

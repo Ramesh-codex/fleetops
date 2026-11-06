@@ -1,17 +1,53 @@
-# FleetOps — Real-Time School Bus Tracking & Parent ETA Pipeline
+# FleetOps — Real-Time School Bus Tracking & AI Breakdown Recovery
 
-A portfolio project: turn a stream of raw, messy bus GPS pings into live bus
-positions, per-stop ETAs, "your bus is ~5 minutes away" alerts for parents, and
-GPS-loss incidents for dispatchers.
+Messy bus GPS in, trustworthy parent alerts out. Kafka → a crash-safe consumer → Postgres/PostGIS,
+with breakdown detection and an AI agent (Claude) that proposes a replacement bus for a human
+dispatcher to approve.
+
+[![CI](https://github.com/Ramesh-codex/fleetops/actions/workflows/ci.yml/badge.svg)](https://github.com/Ramesh-codex/fleetops/actions/workflows/ci.yml)
+&nbsp;Python · FastAPI · Kafka · PostgreSQL + PostGIS · Docker Compose · Prometheus · Grafana · Claude API
+
+![FleetOps demo: buses move, two break down, recovery plans appear, a dispatcher approves one and parents are notified](docs/demo.gif)
+
+*Buses move; red ones have broken down. The recovery worker proposes a spare bus for each, a
+dispatcher clicks Approve, and the parents on that route get "replacement sent". (Recorded on
+synthetic data; map tiles were off on the recording machine.)*
+
+## Three results
+
+| | |
+|---|---|
+| **Crash-safe on real Kafka** | Consumer killed 18 times between the DB commit and the offset commit: **0 duplicate and 0 missing parent alerts**. Throughput 9,731 msg/s, p99 batch 48 ms (CI). |
+| **Alerts parents can trust** | ETA error 5 min out: **272 s → 57 s**. Parents left with an alert sent 10+ min early when buses break down: **25.8% → 0.3%**, with 0 false breakdowns. |
+| **AI that can't act alone** | Claude picks a bus by id through 9 read-only tools; the system computes ETA and seats, a validator checks every plan, a dispatcher approves under row locks. **13 eval cases** pass, incl. hallucinated ids, timeouts and approval races. |
+
+Along the way: **18 documented bugs**, each with root cause, fix and a regression test
+([Engineering findings](#engineering-findings)).
+
+## Quick start
+
+```bash
+git clone https://github.com/Ramesh-codex/fleetops && cd fleetops
+docker compose up --build -d          # 8 containers: Kafka, Postgres, consumer, recovery, API, ...
+# map + dispatcher panel: http://localhost:8000     Grafana: http://localhost:3000
+```
+
+No Docker? `pip install -e ".[dev]"` then `uvicorn fleetops.api:app` runs a single-process demo.
+
+```mermaid
+flowchart LR
+  S[Simulator<br/>GPS every 5 s + faults] -->|key = bus id| K[(Kafka<br/>gps.pings.v1)]
+  K --> C[Consumer<br/>validate → tracker]
+  C -->|bad| D[(Dead letters)]
+  C -->|state + alerts + incidents<br/>one transaction, then offset commit| P[(Postgres + PostGIS)]
+  P --> A[API + live map]
+  P -->|open breakdown| R[Recovery worker<br/>Claude + tools → validator]
+  R -->|plan| P
+  A -->|approve / reject<br/>role-checked, audited| P
+  C -. metrics .-> M[Prometheus → Grafana]
+```
 
 > Independent project. Synthetic data only — no real routes, students, or company systems.
-
-**Status: v0.3** — breakdown detection, parent delay updates, and an AI recovery agent that
-proposes a replacement bus for a dispatcher to approve; on top of v0.2 (Kafka,
-PostgreSQL/PostGIS, crash-safe consumer, dead letters, Prometheus + Grafana).
-Nothing below is claimed unless it runs.
-
-![Live map](docs/screenshot.png)
 
 ## Architecture
 
@@ -30,8 +66,10 @@ dispatcher (map UI or API, role-checked) ──▶ approve: re-validate under ro
                                              notify parents, audit log
 ```
 
-`FLEETOPS_MODE=demo` (default) still runs the whole thing in one process with no Kafka or
-database, which is what `uvicorn fleetops.api:app` gives you.
+Detailed version of the diagram above. `FLEETOPS_MODE=demo` (default) runs everything in one
+process with no Kafka or database, which is what `uvicorn fleetops.api:app` gives you.
+
+![Live map](docs/screenshot.png)
 
 - **Simulator** (`fleetops/simulator.py`) — seeded, so every run is reproducible.
   Generates routes, stops, and 5-second GPS pings with GPS noise, traffic, dwell at stops,
@@ -106,6 +144,7 @@ unconfirmed breakdown as risks on its own, and every plan passed the validator.
 | Two plans, one spare | second approval blocked under lock, recorded | `test_two_plans_cannot_assign_the_same_spare` |
 | Breakdown ends before a decision | approval blocked; plan superseded | `test_approval_blocked_after_breakdown_ends` |
 | Model leaks markup into its text fields (seen live) | clean rationale, risks recovered | `test_case_llm_leaks_markup_into_rationale` |
+| No spare free because others are held by pending plans | reason names the held spares | `test_no_feasible_reason_names_spares_held_by_other_plans` |
 
 ## Engineering findings
 
@@ -232,6 +271,12 @@ dispatcher saw junk text and lost the model's warnings. Fix: the submit tool is 
 the free-text fields are cleaned before storing: the leaked part is split off, the risk list is
 recovered when it parses, stray tags are removed. The scripted-client tests could never have
 produced this; it took a real model.
+
+**18. "No feasible plan" read as if the fleet had no big buses.** Seen while recording the demo
+GIF: a card said "no available spare seats 28 riders (largest: 24)". True, but the three
+72-seat spares were held by other pending plans, and the message didn't say so. A dispatcher
+would conclude the wrong thing. Fix: the reason now names the spares that would fit and are held
+by other plans.
 
 **Known limit:** after a breakdown, stops just past where the bus stopped get their fresh
 alert late (10% of scored stops in the breakdown scenario; 92 of the 93 late alerts are
