@@ -99,8 +99,13 @@ incidents now match a single ordered stream exactly.
 **7. Restoring tracker state is what prevents duplicate alerts after a crash.** The consumer
 was killed between the DB commit and the Kafka offset commit every 4th batch. Restarting
 with tracker state restored from Postgres: 0 re-alert attempts. Restarting with an empty
-tracker: every redelivered ping re-triggered alerts, and only the database constraint kept
-parents from receiving them (numbers in the pipeline benchmark below).
+tracker: 514 re-alert attempts over 18 crashes on real Kafka, and only the database
+constraint kept parents from receiving them. Two layers, each tested on its own.
+
+**8. One image, three services, one wrong health check.** The Dockerfile's health check
+called the API's `/health`, but the consumer and producer run from the same image and
+don't serve it, so Compose marked the consumer unhealthy and the stack never came up in CI.
+Fix: each service declares what "healthy" means for it (consumer: its metrics endpoint).
 
 **Known limit:** breakdowns still cause ~26% early alerts — the alert went out before the
 bus broke down, and no ETA model can foresee that. The fix belongs to the next layer:
@@ -130,8 +135,15 @@ Target lead is 300 s. Only stops more than 6 minutes from the trip start are sco
 ### Pipeline benchmark (Kafka → consumer → Postgres)
 
 `python bench/pipeline_bench.py` against `docker compose up -d kafka postgres`. CI runs it
-on every push against real Kafka and posts the report in the run summary.
-Results: [`bench/PIPELINE_RESULTS.md`](bench/PIPELINE_RESULTS.md) (pending first real-Kafka run).
+on every push against real Kafka 3.9 and posts the report in the run summary.
+Numbers below are from a GitHub Actions runner: [`bench/PIPELINE_RESULTS.md`](bench/PIPELINE_RESULTS.md).
+
+| | |
+|---|---|
+| Backlog drain, one consumer (validate + track + Postgres transaction + offset commit) | 9,731 msg/s; batch of 500: p50 27 ms, p99 48 ms (38,047 pings, 200 buses) |
+| Crash between DB commit and offset commit, every 4th batch (18 crashes) | 0 duplicate alerts stored, 0 missing vs an uninterrupted run |
+| … restarting with state restored from Postgres | 0 re-alert attempts |
+| … restarting with an empty tracker | 514 re-alert attempts, all blocked only by the DB constraint |
 
 ## Run it
 

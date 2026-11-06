@@ -6,8 +6,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - run: pip install -e ".[dev]"
@@ -19,8 +19,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: test
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - run: pip install -e ".[dev]"
@@ -51,7 +51,7 @@ jobs:
       FLEETOPS_SPEEDUP: "60"
       FLEETOPS_POISON: "0.01"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: docker compose config -q
       - run: docker compose up -d --build --wait kafka postgres consumer api prometheus grafana
       - run: docker compose up -d producer

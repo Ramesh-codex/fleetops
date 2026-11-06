@@ -61,6 +61,9 @@ services:
   consumer:
     <<: *app
     command: ["python", "-m", "fleetops.consumer"]
+    environment:
+      <<: *app-env
+      FLEETOPS_HEALTH_URL: http://localhost:9108/metrics
     depends_on:
       kafka: { condition: service_healthy }
       postgres: { condition: service_healthy }
@@ -72,6 +75,8 @@ services:
       <<: *app-env
       FLEETOPS_SPEEDUP: "${FLEETOPS_SPEEDUP:-10}"
       FLEETOPS_POISON: "${FLEETOPS_POISON:-0.001}"
+    healthcheck:
+      disable: true            # a pure producer serves nothing to check
     depends_on:
       kafka: { condition: service_healthy }
 
